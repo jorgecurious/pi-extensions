@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 
 const RALPH_DIR = ".ralph";
+const SWARM_DIR = path.join(RALPH_DIR, "swarm");
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 
 const DEFAULT_TEMPLATE = `# Task
@@ -63,6 +64,10 @@ Pause and reflect on your progress:
 Update the task file with your reflection, then continue working.`;
 
 type LoopStatus = "active" | "paused" | "completed";
+type SwarmRunStatus = "active" | "paused" | "completed";
+type SwarmAgentStatus = "queued" | "active" | "paused" | "blocked" | "completed" | "cancelled";
+type SwarmAgentMode = "read-only" | "writer" | "verifier" | "integrator";
+type CognitiveLoadLevel = "low" | "medium" | "high" | "critical";
 
 interface LoopState {
 	name: string;
@@ -79,10 +84,75 @@ interface LoopState {
 	lastReflectionAt: number; // Last iteration we reflected at
 }
 
+interface SwarmDecision {
+	text: string;
+	rationale?: string;
+	createdAt: string;
+}
+
+interface SwarmBlocker {
+	text: string;
+	neededDecision?: string;
+	createdAt: string;
+	resolvedAt?: string;
+}
+
+interface SwarmRun {
+	id: string;
+	name: string;
+	goal: string;
+	constraints: string[];
+	status: SwarmRunStatus;
+	maxAgents: number;
+	agentIds: string[];
+	decisions: SwarmDecision[];
+	blockers: SwarmBlocker[];
+	verification?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+interface SwarmAgent {
+	id: string;
+	runId: string;
+	role: string;
+	mode: SwarmAgentMode;
+	loopName: string;
+	taskFile: string;
+	status: SwarmAgentStatus;
+	allowedPaths: string[];
+	ownedPaths: string[];
+	dependencies: string[];
+	maxIterations: number;
+	itemsPerIteration: number;
+	reflectEvery: number;
+	lastSummary?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+interface CognitiveLoadReport {
+	level: CognitiveLoadLevel;
+	score: number;
+	reasons: string[];
+	activeAgents: number;
+	writerAgents: number;
+	blockedAgents: number;
+}
+
 const STATUS_ICONS: Record<LoopStatus, string> = { active: "▶", paused: "⏸", completed: "✓" };
+const SWARM_STATUS_ICONS: Record<SwarmRunStatus | SwarmAgentStatus, string> = {
+	active: "▶",
+	paused: "⏸",
+	completed: "✓",
+	queued: "…",
+	blocked: "!",
+	cancelled: "×",
+};
 
 export default function (pi: ExtensionAPI) {
 	let currentLoop: string | null = null;
+	let currentSwarm: string | null = null;
 
 	// --- File helpers ---
 
@@ -175,12 +245,272 @@ export default function (pi: ExtensionAPI) {
 			.filter((s): s is LoopState => s !== null);
 	}
 
+	// --- Swarm state management ---
+
+	const swarmDir = (ctx: ExtensionContext) => path.resolve(ctx.cwd, SWARM_DIR);
+	const swarmRunPath = (ctx: ExtensionContext, runId: string) => path.join(swarmDir(ctx), `${sanitize(runId)}.run.json`);
+	const swarmAgentPath = (ctx: ExtensionContext, agentId: string) => path.join(swarmDir(ctx), `${sanitize(agentId)}.agent.json`);
+
+	function nowIso(): string {
+		return new Date().toISOString();
+	}
+
+	function normalizeStringList(value: unknown): string[] {
+		return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
+	}
+
+	function migrateSwarmRun(raw: Partial<SwarmRun> & { id: string; name?: string }): SwarmRun {
+		const timestamp = nowIso();
+		return {
+			id: sanitize(raw.id),
+			name: raw.name || raw.id,
+			goal: raw.goal || "",
+			constraints: normalizeStringList(raw.constraints),
+			status: raw.status || "active",
+			maxAgents: raw.maxAgents ?? 4,
+			agentIds: normalizeStringList(raw.agentIds),
+			decisions: Array.isArray(raw.decisions) ? raw.decisions : [],
+			blockers: Array.isArray(raw.blockers) ? raw.blockers : [],
+			verification: raw.verification,
+			createdAt: raw.createdAt || timestamp,
+			updatedAt: raw.updatedAt || timestamp,
+		};
+	}
+
+	function migrateSwarmAgent(raw: Partial<SwarmAgent> & { id: string; runId: string; loopName: string }): SwarmAgent {
+		const timestamp = nowIso();
+		return {
+			id: sanitize(raw.id),
+			runId: sanitize(raw.runId),
+			role: raw.role || raw.id,
+			mode: raw.mode || "read-only",
+			loopName: sanitize(raw.loopName),
+			taskFile: raw.taskFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.md`),
+			status: raw.status || "queued",
+			allowedPaths: normalizeStringList(raw.allowedPaths),
+			ownedPaths: normalizeStringList(raw.ownedPaths),
+			dependencies: normalizeStringList(raw.dependencies),
+			maxIterations: raw.maxIterations ?? 20,
+			itemsPerIteration: raw.itemsPerIteration ?? 2,
+			reflectEvery: raw.reflectEvery ?? 5,
+			lastSummary: raw.lastSummary,
+			createdAt: raw.createdAt || timestamp,
+			updatedAt: raw.updatedAt || timestamp,
+		};
+	}
+
+	function loadSwarmRun(ctx: ExtensionContext, runId: string): SwarmRun | null {
+		const content = tryRead(swarmRunPath(ctx, runId));
+		return content ? migrateSwarmRun(JSON.parse(content)) : null;
+	}
+
+	function saveSwarmRun(ctx: ExtensionContext, run: SwarmRun): void {
+		run.updatedAt = nowIso();
+		const filePath = swarmRunPath(ctx, run.id);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(run, null, 2), "utf-8");
+	}
+
+	function loadSwarmAgent(ctx: ExtensionContext, agentId: string): SwarmAgent | null {
+		const content = tryRead(swarmAgentPath(ctx, agentId));
+		return content ? migrateSwarmAgent(JSON.parse(content)) : null;
+	}
+
+	function saveSwarmAgent(ctx: ExtensionContext, agent: SwarmAgent): void {
+		agent.updatedAt = nowIso();
+		const filePath = swarmAgentPath(ctx, agent.id);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(agent, null, 2), "utf-8");
+	}
+
+	function listSwarmRuns(ctx: ExtensionContext): SwarmRun[] {
+		const dir = swarmDir(ctx);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".run.json"))
+			.map((f) => {
+				const content = tryRead(path.join(dir, f));
+				return content ? migrateSwarmRun(JSON.parse(content)) : null;
+			})
+			.filter((run): run is SwarmRun => run !== null);
+	}
+
+	function listSwarmAgents(ctx: ExtensionContext, runId?: string): SwarmAgent[] {
+		const dir = swarmDir(ctx);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".agent.json"))
+			.map((f) => {
+				const content = tryRead(path.join(dir, f));
+				return content ? migrateSwarmAgent(JSON.parse(content)) : null;
+			})
+			.filter((agent): agent is SwarmAgent => agent !== null && (!runId || agent.runId === sanitize(runId)));
+	}
+
+	function latestActiveSwarmRun(ctx: ExtensionContext): SwarmRun | null {
+		const runs = listSwarmRuns(ctx).filter((run) => run.status === "active");
+		if (runs.length === 0) return null;
+		return runs.reduce((best, candidate) => (candidate.updatedAt > best.updatedAt ? candidate : best));
+	}
+
+	function loadTargetSwarmRun(ctx: ExtensionContext, runId?: string): SwarmRun | null {
+		if (runId) return loadSwarmRun(ctx, runId);
+		if (currentSwarm) {
+			const current = loadSwarmRun(ctx, currentSwarm);
+			if (current) return current;
+		}
+		return latestActiveSwarmRun(ctx);
+	}
+
+	function syncSwarmAgentFromLoop(ctx: ExtensionContext, agent: SwarmAgent): SwarmAgent {
+		const loop = loadState(ctx, agent.loopName);
+		if (!loop) return agent;
+		if (loop.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
+		else if (loop.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "paused";
+		else if (loop.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "active";
+		saveSwarmAgent(ctx, agent);
+		return agent;
+	}
+
+	function markSwarmAgentByLoop(ctx: ExtensionContext, loopName: string, status: SwarmAgentStatus): void {
+		for (const agent of listSwarmAgents(ctx)) {
+			if (agent.loopName !== loopName) continue;
+			agent.status = status;
+			saveSwarmAgent(ctx, agent);
+			const run = loadSwarmRun(ctx, agent.runId);
+			if (run) saveSwarmRun(ctx, run);
+		}
+	}
+
+	function cognitiveLoad(ctx: ExtensionContext, run: SwarmRun): CognitiveLoadReport {
+		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
+		const activeAgents = agents.filter((agent) => agent.status === "active").length;
+		const writerAgents = agents.filter((agent) => agent.status === "active" && agent.mode === "writer").length;
+		const blockedAgents = agents.filter((agent) => agent.status === "blocked").length;
+		const unresolvedBlockers = run.blockers.filter((blocker) => !blocker.resolvedAt).length;
+		const pathOwners = new Map<string, string[]>();
+		for (const agent of agents) {
+			for (const ownerPath of agent.ownedPaths) {
+				const owners = pathOwners.get(ownerPath) || [];
+				owners.push(agent.id);
+				pathOwners.set(ownerPath, owners);
+			}
+		}
+		const overlaps = [...pathOwners.values()].filter((owners) => owners.length > 1).length;
+
+		let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + overlaps * 2;
+		if (agents.length > run.maxAgents) score += agents.length - run.maxAgents;
+
+		const reasons: string[] = [];
+		if (activeAgents > 0) reasons.push(`${activeAgents} active agent(s)`);
+		if (writerAgents > 1) reasons.push(`${writerAgents} active writer agent(s)`);
+		if (blockedAgents > 0) reasons.push(`${blockedAgents} blocked agent(s)`);
+		if (unresolvedBlockers > 0) reasons.push(`${unresolvedBlockers} unresolved blocker(s)`);
+		if (overlaps > 0) reasons.push(`${overlaps} overlapping owned path(s)`);
+		if (agents.length > run.maxAgents) reasons.push(`${agents.length}/${run.maxAgents} agent budget exceeded`);
+		if (reasons.length === 0) reasons.push("within budget");
+
+		let level: CognitiveLoadLevel = "low";
+		if (score >= 10) level = "critical";
+		else if (score >= 7) level = "high";
+		else if (score >= 4) level = "medium";
+
+		return { level, score, reasons, activeAgents, writerAgents, blockedAgents };
+	}
+
+	function renderSwarmBoard(ctx: ExtensionContext, run: SwarmRun): string {
+		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
+		const load = cognitiveLoad(ctx, run);
+		const lines = [
+			`Swarm: ${run.id} (${SWARM_STATUS_ICONS[run.status]} ${run.status})`,
+			`Goal: ${run.goal || "(none recorded)"}`,
+			`Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
+		];
+		if (run.constraints.length > 0) lines.push(`Constraints: ${run.constraints.join("; ")}`);
+		if (agents.length === 0) {
+			lines.push("Agents: none");
+		} else {
+			lines.push("Agents:");
+			for (const agent of agents) {
+				const paths = agent.ownedPaths.length > 0 ? ` owns ${agent.ownedPaths.join(",")}` : "";
+				lines.push(`- ${agent.id}: ${SWARM_STATUS_ICONS[agent.status]} ${agent.status}, ${agent.mode}, loop ${agent.loopName}${paths}`);
+			}
+		}
+		const unresolved = run.blockers.filter((blocker) => !blocker.resolvedAt);
+		if (unresolved.length > 0) lines.push(`Blockers: ${unresolved.map((blocker) => blocker.text).join("; ")}`);
+		if (run.decisions.length > 0) lines.push(`Latest decision: ${run.decisions[run.decisions.length - 1].text}`);
+		return lines.join("\n");
+	}
+
+	function buildSwarmAgentTaskContent(
+		run: SwarmRun,
+		role: string,
+		taskContent: string,
+		mode: SwarmAgentMode,
+		allowedPaths: string[],
+		ownedPaths: string[],
+	): string {
+		const scope = [
+			`Mode: ${mode}`,
+			`Allowed paths: ${allowedPaths.length > 0 ? allowedPaths.join(", ") : "not specified"}`,
+			`Owned paths: ${ownedPaths.length > 0 ? ownedPaths.join(", ") : "none"}`,
+		].join("\n");
+
+		return `# Swarm Agent: ${role}
+
+## Run
+- Swarm: ${run.id}
+- Goal: ${run.goal}
+
+## Role
+${role}
+
+## Scope
+${scope}
+
+## Constraints
+${run.constraints.length > 0 ? run.constraints.map((constraint) => `- ${constraint}`).join("\n") : "- Follow the top-level user instructions and repository safety rules."}
+
+## Task
+${taskContent}
+
+## Checklist
+- [ ] Inspect relevant context before acting
+- [ ] Complete the assigned role-specific work
+- [ ] Record evidence, findings, and exact commands
+- [ ] Report blockers instead of guessing when scope is unclear
+
+## Verification
+- Commands run, working directories, relevant environment variables, outputs, and preserved artifacts
+
+## Final Verification
+- Exact monitor-rerunnable command: <command>
+- Working directory: <path>
+- Required preserved artifacts: <paths>
+- Result: <output summary>
+
+## Return Format
+- Status
+- Findings
+- Commands run
+- Evidence
+- Risks
+- Next recommended action
+
+## Notes
+(Update this as you work)
+`;
+	}
+
 	// --- Loop state transitions ---
 
 	function pauseLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
 		state.status = "paused";
 		state.active = false;
 		saveState(ctx, state);
+		markSwarmAgentByLoop(ctx, state.name, "paused");
 		currentLoop = null;
 		updateUI(ctx);
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
@@ -191,6 +521,7 @@ export default function (pi: ExtensionAPI) {
 		state.completedAt = new Date().toISOString();
 		state.active = false;
 		saveState(ctx, state);
+		markSwarmAgentByLoop(ctx, state.name, "completed");
 		currentLoop = null;
 		updateUI(ctx);
 		pi.sendUserMessage(banner, {
@@ -204,6 +535,7 @@ export default function (pi: ExtensionAPI) {
 		state.completedAt = new Date().toISOString();
 		state.active = false;
 		saveState(ctx, state);
+		markSwarmAgentByLoop(ctx, state.name, "completed");
 		currentLoop = null;
 		updateUI(ctx);
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
@@ -219,6 +551,7 @@ export default function (pi: ExtensionAPI) {
 
 	function updateUI(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
+		updateSwarmUI(ctx);
 
 		const state = currentLoop ? loadState(ctx, currentLoop) : null;
 		if (!state) {
@@ -250,6 +583,25 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget("ralph", lines);
 	}
 
+	function updateSwarmUI(ctx: ExtensionContext): void {
+		if (!ctx.hasUI) return;
+		const run = loadTargetSwarmRun(ctx);
+		if (!run) {
+			ctx.ui.setStatus("swarm", undefined);
+			ctx.ui.setWidget("swarm", undefined);
+			return;
+		}
+		const load = cognitiveLoad(ctx, run);
+		const { theme } = ctx.ui;
+		ctx.ui.setStatus("swarm", theme.fg("accent", `swarm ${run.id}: ${load.level}`));
+		ctx.ui.setWidget(
+			"swarm",
+			renderSwarmBoard(ctx, run)
+				.split("\n")
+				.map((line, idx) => (idx === 0 ? theme.fg("accent", theme.bold(line)) : theme.fg("dim", line))),
+		);
+	}
+
 	// --- Prompt building ---
 
 	function buildPrompt(state: LoopState, taskContent: string, isReflection: boolean): string {
@@ -278,7 +630,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		parts.push(`2. Update the task file (${state.taskFile}) with your progress`);
 		parts.push(`3. When FULLY COMPLETE and the completion gate is satisfied, respond with: ${COMPLETE_MARKER}`);
-		parts.push(`4. Otherwise, call the ralph_done tool to proceed to next iteration`);
+		parts.push(`4. Otherwise, call ralph_done with {"name":"${state.name}"} to proceed to next iteration`);
 
 		return parts.join("\n");
 	}
@@ -315,6 +667,46 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		return result;
+	}
+
+	function advanceRalphLoop(ctx: ExtensionContext, loopName: string): string {
+		const state = loadState(ctx, loopName);
+		if (!state || state.status !== "active") return "Ralph loop is not active.";
+
+		if (ctx.hasPendingMessages()) return "Pending messages already queued. Skipping ralph_done.";
+
+		state.iteration++;
+
+		if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
+			completeLoop(
+				ctx,
+				state,
+				`───────────────────────────────────────────────────────────────────────
+⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
+──────────────────────────────────────────────────────────────────────`,
+			);
+			return "Max iterations reached. Loop stopped.";
+		}
+
+		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
+		if (needsReflection) state.lastReflectionAt = state.iteration;
+
+		saveState(ctx, state);
+		currentLoop = state.name;
+		updateUI(ctx);
+
+		const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
+		if (!content) {
+			pauseLoop(ctx, state);
+			return `Error: Could not read task file: ${state.taskFile}`;
+		}
+
+		pi.sendUserMessage(buildPrompt(state, content, needsReflection), {
+			deliverAs: "followUp",
+			streamingBehavior: "followUp",
+		});
+
+		return `Iteration ${state.iteration - 1} complete. Next iteration queued.`;
 	}
 
 	// --- Commands ---
@@ -549,6 +941,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				currentLoop = null;
+				currentSwarm = null;
 				const ok = tryRemoveDir(dir);
 				if (ctx.hasUI) {
 					ctx.ui.notify(ok ? "Removed .ralph directory." : "Failed to remove .ralph directory.", ok ? "info" : "error");
@@ -597,6 +990,102 @@ Examples:
   /ralph start my-feature
   /ralph start review --items-per-iteration 5 --reflect-every 10`;
 
+	const SWARM_HELP = `Pi Swarm - Ralph-backed subagent orchestration
+
+Commands:
+  /swarm start <name> <goal>       Create a swarm run
+  /swarm status [run]              Show run board and cognitive load
+  /swarm agents [run]              Show agents for a run
+  /swarm pause [run]               Pause run metadata
+  /swarm resume [run]              Resume run metadata
+  /swarm stop [run]                Mark run completed
+  /swarm summarize [run]           Show compact board
+
+Agents should use the swarm_* tools for structured orchestration.`;
+
+	const swarmCommands: Record<string, (rest: string, ctx: ExtensionContext) => void> = {
+		start(rest, ctx) {
+			const [name, ...goalParts] = rest.trim().split(/\s+/);
+			if (!name) {
+				ctx.ui.notify("Usage: /swarm start <name> <goal>", "warning");
+				return;
+			}
+			const runId = sanitize(name);
+			const goal = goalParts.join(" ").trim() || "Describe the swarm goal.";
+			const run: SwarmRun = {
+				id: runId,
+				name,
+				goal,
+				constraints: [],
+				status: "active",
+				maxAgents: 4,
+				agentIds: [],
+				decisions: [],
+				blockers: [],
+				createdAt: nowIso(),
+				updatedAt: nowIso(),
+			};
+			saveSwarmRun(ctx, run);
+			currentSwarm = run.id;
+			updateUI(ctx);
+			ctx.ui.notify(renderSwarmBoard(ctx, run), "info");
+		},
+
+		status(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			ctx.ui.notify(run ? renderSwarmBoard(ctx, run) : "No swarm run found.", run ? "info" : "warning");
+		},
+
+		agents(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			if (!run) {
+				ctx.ui.notify("No swarm run found.", "warning");
+				return;
+			}
+			const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
+			ctx.ui.notify(
+				agents.length > 0
+					? agents.map((agent) => `${agent.id}: ${agent.status}, ${agent.mode}, loop=${agent.loopName}`).join("\n")
+					: `No agents for swarm ${run.id}.`,
+				"info",
+			);
+		},
+
+		pause(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			if (!run) return ctx.ui.notify("No swarm run found.", "warning");
+			run.status = "paused";
+			saveSwarmRun(ctx, run);
+			updateUI(ctx);
+			ctx.ui.notify(`Paused swarm: ${run.id}`, "info");
+		},
+
+		resume(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			if (!run) return ctx.ui.notify("No swarm run found.", "warning");
+			run.status = "active";
+			saveSwarmRun(ctx, run);
+			currentSwarm = run.id;
+			updateUI(ctx);
+			ctx.ui.notify(renderSwarmBoard(ctx, run), "info");
+		},
+
+		stop(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			if (!run) return ctx.ui.notify("No swarm run found.", "warning");
+			run.status = "completed";
+			saveSwarmRun(ctx, run);
+			if (currentSwarm === run.id) currentSwarm = null;
+			updateUI(ctx);
+			ctx.ui.notify(`Completed swarm: ${run.id}`, "info");
+		},
+
+		summarize(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			ctx.ui.notify(run ? renderSwarmBoard(ctx, run) : "No swarm run found.", run ? "info" : "warning");
+		},
+	};
+
 	pi.registerCommand("ralph", {
 		description: "Ralph Wiggum - long-running development loops",
 		handler: async (args, ctx) => {
@@ -606,6 +1095,19 @@ Examples:
 				handler(args.slice(cmd.length).trim(), ctx);
 			} else {
 				ctx.ui.notify(HELP, "info");
+			}
+		},
+	});
+
+	pi.registerCommand("swarm", {
+		description: "Pi Swarm - Ralph-backed subagent orchestration",
+		handler: async (args, ctx) => {
+			const [cmd] = args.trim().split(/\s+/);
+			const handler = swarmCommands[cmd];
+			if (handler) {
+				handler(args.slice(cmd.length).trim(), ctx);
+			} else {
+				ctx.ui.notify(SWARM_HELP, "info");
 			}
 		},
 	});
@@ -699,6 +1201,284 @@ Examples:
 		},
 	});
 
+	pi.registerTool({
+		name: "swarm_start",
+		label: "Start Swarm Run",
+		description: "Start a Ralph-backed swarm run for multi-agent orchestration.",
+		promptSnippet: "Create a swarm run with a goal, constraints, and cognitive-load budget.",
+		promptGuidelines: [
+			"Use before spawning multiple Ralph-backed subagents.",
+			"Keep constraints explicit so subagents inherit the same safety and verification contract.",
+		],
+		parameters: Type.Object({
+			name: Type.String({ description: "Run name" }),
+			goal: Type.String({ description: "Top-level swarm objective" }),
+			constraints: Type.Optional(Type.Array(Type.String(), { description: "Shared constraints for all agents" })),
+			maxAgents: Type.Optional(Type.Number({ description: "Cognitive-load agent budget", default: 4 })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const runId = sanitize(params.name);
+			const run: SwarmRun = {
+				id: runId,
+				name: params.name,
+				goal: params.goal,
+				constraints: params.constraints ?? [],
+				status: "active",
+				maxAgents: params.maxAgents ?? 4,
+				agentIds: [],
+				decisions: [],
+				blockers: [],
+				createdAt: nowIso(),
+				updatedAt: nowIso(),
+			};
+			saveSwarmRun(ctx, run);
+			currentSwarm = run.id;
+			updateUI(ctx);
+			return { content: [{ type: "text", text: renderSwarmBoard(ctx, run) }], details: { runId: run.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_spawn_agent",
+		label: "Spawn Swarm Agent",
+		description: "Create a Ralph loop as a scoped swarm subagent.",
+		promptSnippet: "Spawn a role-specific Ralph-backed agent with scope, ownership, and pacing controls.",
+		promptGuidelines: [
+			"Prefer read-only scout/verifier agents when cognitive load is high.",
+			"Use ownedPaths for writer agents so overlapping edits are visible.",
+		],
+		parameters: Type.Object({
+			runId: Type.String({ description: "Swarm run id" }),
+			role: Type.String({ description: "Agent role name" }),
+			taskContent: Type.String({ description: "Role-specific task body" }),
+			mode: Type.Optional(Type.Union([
+				Type.Literal("read-only"),
+				Type.Literal("writer"),
+				Type.Literal("verifier"),
+				Type.Literal("integrator"),
+			])),
+			allowedPaths: Type.Optional(Type.Array(Type.String())),
+			ownedPaths: Type.Optional(Type.Array(Type.String())),
+			dependencies: Type.Optional(Type.Array(Type.String())),
+			maxIterations: Type.Optional(Type.Number({ default: 20 })),
+			itemsPerIteration: Type.Optional(Type.Number({ default: 2 })),
+			reflectEvery: Type.Optional(Type.Number({ default: 5 })),
+			autoQueue: Type.Optional(Type.Boolean({ description: "Queue first Ralph prompt immediately", default: true })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
+			if (run.status !== "active") return { content: [{ type: "text", text: `Swarm run is ${run.status}: ${run.id}` }], details: {} };
+
+			const mode = (params.mode ?? "read-only") as SwarmAgentMode;
+			const allowedPaths = params.allowedPaths ?? [];
+			const ownedPaths = params.ownedPaths ?? [];
+			const existingAgents = listSwarmAgents(ctx, run.id);
+			const index = existingAgents.length + 1;
+			const loopName = sanitize(`swarm-${run.id}-${params.role}-${index}`);
+			const agentId = loopName;
+			const taskFile = path.join(RALPH_DIR, `${loopName}.md`);
+			const taskContent = buildSwarmAgentTaskContent(run, params.role, params.taskContent, mode, allowedPaths, ownedPaths);
+			const fullPath = path.resolve(ctx.cwd, taskFile);
+			ensureDir(fullPath);
+			fs.writeFileSync(fullPath, taskContent, "utf-8");
+
+			const load = cognitiveLoad(ctx, run);
+			const autoQueue = (params.autoQueue ?? true) && load.level !== "critical";
+			const loopState: LoopState = {
+				name: loopName,
+				taskFile,
+				iteration: 1,
+				maxIterations: params.maxIterations ?? 20,
+				itemsPerIteration: params.itemsPerIteration ?? 2,
+				reflectEvery: params.reflectEvery ?? 5,
+				reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
+				active: autoQueue,
+				status: autoQueue ? "active" : "paused",
+				startedAt: nowIso(),
+				lastReflectionAt: 0,
+			};
+			saveState(ctx, loopState);
+
+			const agent: SwarmAgent = {
+				id: agentId,
+				runId: run.id,
+				role: params.role,
+				mode,
+				loopName,
+				taskFile,
+				status: autoQueue ? "active" : "paused",
+				allowedPaths,
+				ownedPaths,
+				dependencies: params.dependencies ?? [],
+				maxIterations: loopState.maxIterations,
+				itemsPerIteration: loopState.itemsPerIteration,
+				reflectEvery: loopState.reflectEvery,
+				createdAt: nowIso(),
+				updatedAt: nowIso(),
+			};
+			saveSwarmAgent(ctx, agent);
+			run.agentIds.push(agent.id);
+			saveSwarmRun(ctx, run);
+			currentSwarm = run.id;
+
+			if (autoQueue) {
+				currentLoop = loopName;
+				pi.sendUserMessage(buildPrompt(loopState, taskContent, false), {
+					deliverAs: "followUp",
+					streamingBehavior: "followUp",
+				});
+			}
+			updateUI(ctx);
+			const queueNote = autoQueue ? "queued first iteration" : "created paused because autoQueue=false or load is critical";
+			return { content: [{ type: "text", text: `${agent.id}: ${queueNote}\n${renderSwarmBoard(ctx, run)}` }], details: { agentId: agent.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_status",
+		label: "Swarm Status",
+		description: "Return the swarm board and cognitive-load report.",
+		parameters: Type.Object({ runId: Type.Optional(Type.String()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadTargetSwarmRun(ctx, params.runId);
+			return { content: [{ type: "text", text: run ? renderSwarmBoard(ctx, run) : "No swarm run found." }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_list_agents",
+		label: "List Swarm Agents",
+		description: "List agents for a swarm run with statuses and loop names.",
+		parameters: Type.Object({ runId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
+			const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
+			const text = agents.length
+				? agents.map((agent) => `${agent.id}: ${agent.status}, ${agent.mode}, loop=${agent.loopName}`).join("\n")
+				: `No agents for swarm ${run.id}.`;
+			return { content: [{ type: "text", text }], details: { count: agents.length } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_cognitive_load",
+		label: "Swarm Cognitive Load",
+		description: "Return the cognitive-load report for a swarm run.",
+		parameters: Type.Object({ runId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
+			const load = cognitiveLoad(ctx, run);
+			const text = `Load: ${load.level} (${load.score})\nActive agents: ${load.activeAgents}\nWriter agents: ${load.writerAgents}\nBlocked agents: ${load.blockedAgents}\nReasons: ${load.reasons.join(", ")}`;
+			return { content: [{ type: "text", text }], details: load };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_collect",
+		label: "Collect Swarm Agent",
+		description: "Collect a swarm agent's Ralph state and task-file evidence.",
+		parameters: Type.Object({ agentId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const synced = syncSwarmAgentFromLoop(ctx, agent);
+			const task = tryRead(path.resolve(ctx.cwd, synced.taskFile)) || "";
+			return {
+				content: [{ type: "text", text: `Agent: ${synced.id}\nStatus: ${synced.status}\nLoop: ${synced.loopName}\n\n${task}` }],
+				details: { agentId: synced.id, status: synced.status },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_advance_agent",
+		label: "Advance Swarm Agent",
+		description: "Advance a Ralph-backed swarm agent to its next iteration.",
+		parameters: Type.Object({ agentId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const result = advanceRalphLoop(ctx, agent.loopName);
+			syncSwarmAgentFromLoop(ctx, agent);
+			return { content: [{ type: "text", text: result }], details: { agentId: agent.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_pause_agent",
+		label: "Pause Swarm Agent",
+		description: "Pause a Ralph-backed swarm agent without deleting its task evidence.",
+		parameters: Type.Object({ agentId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const loop = loadState(ctx, agent.loopName);
+			if (loop && loop.status === "active") pauseLoop(ctx, loop, `Paused swarm agent: ${agent.id}`);
+			agent.status = "paused";
+			saveSwarmAgent(ctx, agent);
+			updateUI(ctx);
+			return { content: [{ type: "text", text: `Paused swarm agent: ${agent.id}` }], details: { agentId: agent.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_cancel_agent",
+		label: "Cancel Swarm Agent",
+		description: "Mark a swarm agent cancelled while preserving its task file and evidence.",
+		parameters: Type.Object({ agentId: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const loop = loadState(ctx, agent.loopName);
+			if (loop && loop.status === "active") pauseLoop(ctx, loop);
+			agent.status = "cancelled";
+			saveSwarmAgent(ctx, agent);
+			updateUI(ctx);
+			return { content: [{ type: "text", text: `Cancelled swarm agent: ${agent.id}` }], details: { agentId: agent.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_record_decision",
+		label: "Record Swarm Decision",
+		description: "Record an integration decision for the current swarm run.",
+		parameters: Type.Object({
+			runId: Type.String(),
+			decision: Type.String(),
+			rationale: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
+			run.decisions.push({ text: params.decision, rationale: params.rationale, createdAt: nowIso() });
+			saveSwarmRun(ctx, run);
+			updateUI(ctx);
+			return { content: [{ type: "text", text: `Recorded decision for ${run.id}: ${params.decision}` }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_record_blocker",
+		label: "Record Swarm Blocker",
+		description: "Record a blocker that should raise cognitive load and pause risky spawning.",
+		parameters: Type.Object({
+			runId: Type.String(),
+			blocker: Type.String(),
+			neededDecision: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
+			run.blockers.push({ text: params.blocker, neededDecision: params.neededDecision, createdAt: nowIso() });
+			saveSwarmRun(ctx, run);
+			updateUI(ctx);
+			return { content: [{ type: "text", text: `Recorded blocker for ${run.id}: ${params.blocker}` }], details: {} };
+		},
+	});
+
 	// Tool for agent to signal iteration complete and request next
 	pi.registerTool({
 		name: "ralph_done",
@@ -709,13 +1489,16 @@ Examples:
 			"Call this after making real iteration progress so Ralph can queue the next prompt.",
 			"Do not call this if there is no active loop, if pending messages are already queued, or if the completion marker has already been emitted.",
 		],
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			if (!currentLoop) {
+		parameters: Type.Object({
+			name: Type.Optional(Type.String({ description: "Loop name to advance; defaults to current loop" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const loopName = params.name ? sanitize(params.name) : currentLoop;
+			if (!loopName) {
 				return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
 			}
 
-			const state = loadState(ctx, currentLoop);
+			const state = loadState(ctx, loopName);
 			if (!state || state.status !== "active") {
 				return { content: [{ type: "text", text: "Ralph loop is not active." }], details: {} };
 			}
@@ -746,6 +1529,7 @@ Examples:
 			if (needsReflection) state.lastReflectionAt = state.iteration;
 
 			saveState(ctx, state);
+			currentLoop = loopName;
 			updateUI(ctx);
 
 			const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
@@ -785,7 +1569,7 @@ Examples:
 		instructions += `- Preserve artifacts needed by final verification\n`;
 		instructions += `- Record an exact monitor-rerunnable final command before completion\n`;
 		instructions += `- When FULLY COMPLETE and externally rerunnable: ${COMPLETE_MARKER}\n`;
-		instructions += `- Otherwise, call ralph_done tool to proceed to next iteration`;
+		instructions += `- Otherwise, call ralph_done with {"name":"${state.name}"} to proceed to next iteration`;
 
 		return {
 			systemPrompt: event.systemPrompt + `\n[RALPH LOOP - ${state.name} - Iteration ${iterStr}]\n\n${instructions}`,
@@ -836,6 +1620,7 @@ Examples:
 
 	pi.on("session_start", async (_event, ctx) => {
 		const active = listLoops(ctx).filter((l) => l.status === "active");
+		const activeSwarms = listSwarmRuns(ctx).filter((run) => run.status === "active");
 
 		// Rehydrate currentLoop from disk. The module is re-initialized on
 		// session reload (including auto-compaction and /compact), which would
@@ -850,12 +1635,19 @@ Examples:
 			});
 			currentLoop = mostRecent.name;
 		}
+		if (!currentSwarm && activeSwarms.length > 0) {
+			currentSwarm = activeSwarms.reduce((best, candidate) => (candidate.updatedAt > best.updatedAt ? candidate : best)).id;
+		}
 
 		if (active.length > 0 && ctx.hasUI) {
 			const lines = active.map(
 				(l) => `  • ${l.name} (iteration ${l.iteration}${l.maxIterations > 0 ? `/${l.maxIterations}` : ""})`,
 			);
 			ctx.ui.notify(`Active Ralph loops:\n${lines.join("\n")}\n\nUse /ralph resume <name> to continue`, "info");
+		}
+		if (activeSwarms.length > 0 && ctx.hasUI) {
+			const lines = activeSwarms.map((run) => `  • ${run.id} (${cognitiveLoad(ctx, run).level})`);
+			ctx.ui.notify(`Active swarms:\n${lines.join("\n")}\n\nUse /swarm status <name> to inspect`, "info");
 		}
 		updateUI(ctx);
 	});
@@ -864,6 +1656,10 @@ Examples:
 		if (currentLoop) {
 			const state = loadState(ctx, currentLoop);
 			if (state) saveState(ctx, state);
+		}
+		if (currentSwarm) {
+			const run = loadSwarmRun(ctx, currentSwarm);
+			if (run) saveSwarmRun(ctx, run);
 		}
 	});
 }

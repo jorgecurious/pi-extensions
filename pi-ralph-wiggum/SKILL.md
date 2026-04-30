@@ -17,12 +17,61 @@ ralph_start({
 })
 ```
 
+## Swarm Mode
+
+Use the `swarm_start` and `swarm_spawn_agent` tools when the task naturally decomposes into specialist workstreams and you need Kimi-style conductor/subagent UX. Swarm mode wraps Ralph loops as scoped subagents and records run state under `.ralph/swarm/`.
+
+Prefer swarm mode when:
+
+- There are independent research, implementation, verification, or review workstreams.
+- More than one role can make progress without touching the same files.
+- The main assistant should stay as integrator while subagents gather evidence.
+- Cognitive load needs explicit tracking across active agents, blockers, decisions, and owned paths.
+
+Avoid swarm mode when:
+
+- The task is a one-shot fix.
+- More parallel agents would create file ownership conflicts.
+- There is an unresolved user/product decision that blocks safe decomposition.
+
+Typical sequence:
+
+```
+swarm_start({
+  name: "metal-pr-review",
+  goal: "Resolve PR review comments and verify the Metal path",
+  constraints: ["one writer per owned path", "record rerunnable verification"],
+  maxAgents: 4
+})
+
+swarm_spawn_agent({
+  runId: "metal-pr-review",
+  role: "verifier",
+  mode: "verifier",
+  taskContent: "Run the focused Metal tests and report failures with exact commands.",
+  allowedPaths: ["testing/python/metal", "src/op"],
+  ownedPaths: [],
+  itemsPerIteration: 2,
+  reflectEvery: 3
+})
+```
+
+Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
+
+Main assistant responsibilities in swarm mode:
+
+- Keep final authority over edits, commits, pushes, and PR updates.
+- Prefer many read-only scout/verifier agents and at most one writer per owned path.
+- Pause spawning when load is high or critical.
+- Collect and summarize subagent evidence before acting.
+- Run or delegate final verification before completion.
+
 ## Loop Behavior
 
 1. **Write the task file**: Create `.ralph/<name>.md` with the task content. The tool does NOT create this file—you must write it yourself using the Write tool.
 2. Work on the task and update the file each iteration.
 3. Record verification evidence (commands run, file paths, outputs) in the task file.
-4. Call `ralph_done` to proceed to the next iteration.
+4. Call `ralph_done` to proceed to the next iteration. In swarm mode, call it with the explicit loop name from the prompt.
 5. Before outputting `<promise>COMPLETE</promise>`, run a final verification command that an external monitor can rerun from the same worktree.
 6. Stop when complete or when max iterations is reached (default 50).
 

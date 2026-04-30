@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Add swarm mode: a lightweight Ralph-backed subagent control plane with `/swarm` commands, `swarm_*` tools, run/agent state under `.ralph/swarm/`, cognitive-load scoring, scoped task files, and decision/blocker recording.
+
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
 - Queue Ralph follow-up messages with `streamingBehavior: "followUp"` to avoid runtime warnings when a loop tool schedules the next iteration while the agent is still processing.

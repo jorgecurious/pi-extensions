@@ -5,10 +5,11 @@ This one is cool because:
 - You can ask Pi and it will set up and run the loop all by itself in-session. If you prefer, it can also invoke another Pi via tmux
 - You can have multiple parallel loops at once in the same repo (unlike OG ralph-wiggum)
 - You can ask Pi to self-reflect at regular intervals so it doesn't mindlessly grind through wrong instructions (optional)
+- You can use swarm mode to wrap Ralph loops as scoped subagents with a Kimi-style conductor/status-board workflow
 
 <img width="432" height="357" alt="Screenshot 2026-01-07 at 17 16 24" src="https://github.com/user-attachments/assets/68cdab11-76c6-4aed-9ea1-558cbb267ea6" />
 
-**Note: This is a flat version without subagents, similar to the [Anthropic plugins implementation](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-loop).**
+**Note: Flat Ralph loops remain the default. Swarm mode adds a lightweight MCP-style control plane on top of Ralph state; the main assistant still acts as conductor/integrator.**
 
 ## Installation
 
@@ -78,6 +79,74 @@ If an already-queued Ralph prompt arrives after a loop has completed, the agent 
 | `/ralph clean [--all]` | Clean completed loops |
 | `/ralph cancel <name>` | Delete a loop |
 | `/ralph nuke [--yes]` | Delete all .ralph data |
+
+## Swarm Mode
+
+Swarm mode stores top-level run and subagent metadata under `.ralph/swarm/` while each subagent is still a normal Ralph loop with a task file and state file. This gives you Kimi-style task decomposition without replacing Ralph's completion gate or stale-prompt guard.
+
+### Swarm commands
+
+| Command | Description |
+|---------|-------------|
+| `/swarm start <name> <goal>` | Create a swarm run |
+| `/swarm status [run]` | Show the run board and cognitive-load score |
+| `/swarm agents [run]` | List agents for a run |
+| `/swarm pause [run]` | Pause run metadata |
+| `/swarm resume [run]` | Resume run metadata |
+| `/swarm stop [run]` | Mark the run completed |
+| `/swarm summarize [run]` | Show a compact board |
+
+### Swarm agent tools
+
+Agents can use:
+
+```ts
+swarm_start({
+  name: "metal-pr-review",
+  goal: "Resolve PR review comments and verify the Metal path",
+  constraints: ["one writer per owned path", "record rerunnable verification"],
+  maxAgents: 4,
+})
+
+swarm_spawn_agent({
+  runId: "metal-pr-review",
+  role: "verifier",
+  mode: "verifier",
+  taskContent: "Run focused tests and report exact failures.",
+  allowedPaths: ["testing/python/metal", "src/op"],
+  ownedPaths: [],
+  itemsPerIteration: 2,
+  reflectEvery: 3,
+})
+```
+
+Additional tools:
+
+- `swarm_status`: return the current board and load score.
+- `swarm_list_agents`: list run agents with statuses and loop names.
+- `swarm_cognitive_load`: return the load score and reasons.
+- `swarm_collect`: read a subagent's task-file evidence.
+- `swarm_advance_agent`: advance a subagent loop.
+- `swarm_pause_agent`: pause a subagent loop without deleting evidence.
+- `swarm_cancel_agent`: cancel an agent while preserving its task file.
+- `swarm_record_decision`: persist an integration decision.
+- `swarm_record_blocker`: persist a blocker and raise load.
+
+### Cognitive load policy
+
+The swarm board scores load from active agents, active writer agents, blocked agents, unresolved blockers, and overlapping owned paths.
+
+- Low: continue normally.
+- Medium: prefer one writer plus read-only verifier/scout agents.
+- High: stop spawning new writers and consolidate evidence.
+- Critical: pause risky spawning; ask for a decision or reduce concurrency.
+
+Recommended pattern:
+
+- Many read-only scouts/verifiers.
+- At most one writer per owned path.
+- One main integrator with final authority over edits, commits, pushes, and PR updates.
+- Verification after integration before completion.
 
 ### Options for start
 
