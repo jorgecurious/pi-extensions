@@ -306,8 +306,16 @@ function resolveGitDir(cwd) {
   return path.resolve(cwd, match[1]);
 }
 
-function commandIgnore(cwd) {
+function resolveExcludeGitDir(cwd) {
   const gitDir = resolveGitDir(cwd);
+  const commonDirFile = path.join(gitDir, "commondir");
+  if (!fs.existsSync(commonDirFile)) return gitDir;
+  const commonDir = fs.readFileSync(commonDirFile, "utf8").trim();
+  return path.resolve(gitDir, commonDir);
+}
+
+function commandIgnore(cwd) {
+  const gitDir = resolveExcludeGitDir(cwd);
   const exclude = path.join(gitDir, "info", "exclude");
   ensureDir(exclude);
   const content = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
