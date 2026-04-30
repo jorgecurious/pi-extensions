@@ -295,9 +295,19 @@ function commandAgentStatus(cwd, args, status) {
   return `${agent.id}: ${status}`;
 }
 
+function resolveGitDir(cwd) {
+  const dotGit = path.join(cwd, ".git");
+  if (!fs.existsSync(dotGit)) throw new Error("No .git directory found in current working directory");
+  if (fs.statSync(dotGit).isDirectory()) return dotGit;
+
+  const content = fs.readFileSync(dotGit, "utf8").trim();
+  const match = content.match(/^gitdir:\s*(.+)$/i);
+  if (!match) throw new Error("Unable to resolve .git file in current working directory");
+  return path.resolve(cwd, match[1]);
+}
+
 function commandIgnore(cwd) {
-  const gitDir = path.join(cwd, ".git");
-  if (!fs.existsSync(gitDir)) throw new Error("No .git directory found in current working directory");
+  const gitDir = resolveGitDir(cwd);
   const exclude = path.join(gitDir, "info", "exclude");
   ensureDir(exclude);
   const content = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
