@@ -5,6 +5,22 @@ import path from "node:path";
 
 const RALPH_DIR = ".ralph";
 const SWARM_DIR = path.join(RALPH_DIR, "swarm");
+const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
+
+const COMPLETION_GATE = `COMPLETION GATE
+
+Do not output ${COMPLETE_MARKER} based only on checked checklist items.
+Before completion:
+1. Run a final verification command that an external monitor can rerun from the same worktree in a fresh shell.
+2. Record the exact command, working directory, relevant environment variables, and output summary in the task file.
+3. Preserve every artifact required by that command, including build directories, generated libraries, virtualenvs, caches, or copied dylibs.
+4. If cleanup removes required artifacts, recreate them or update the final command before completing.
+5. If the final command cannot be made externally rerunnable, mark the item blocked/deferred instead of complete.`;
+
+const STALE_PROMPT_GUARD = `STALE PROMPT GUARD
+
+Before doing any work from a Ralph prompt, reload the loop state file named in the prompt.
+If the state says "status": "completed", do not edit files, do not run task commands, and do not call ralph_done. Reply briefly that the stale prompt was ignored because the loop is already completed.`;
 
 function sanitize(name) {
   return String(name || "")
@@ -43,6 +59,11 @@ function loopStatePath(cwd, loopName) {
 
 function loopTaskPath(cwd, loopName) {
   return path.join(cwd, RALPH_DIR, `${sanitize(loopName)}.md`);
+}
+
+function queueBase(cwd, agentId, queuedAt) {
+  const stamp = queuedAt.replace(/[:.]/g, "-");
+  return path.join(cwd, SWARM_DIR, "queue", `${stamp}-${sanitize(agentId)}`);
 }
 
 function listFiles(dir, suffix) {
@@ -91,7 +112,7 @@ function syncAgent(cwd, agent) {
   const state = readJson(stateFile);
   if (state.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
   else if (state.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "paused";
-  else if (state.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "active";
+  else if (state.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
   agent.updatedAt = nowIso();
   writeJson(agentPath(cwd, agent.id), agent);
   return agent;
@@ -202,6 +223,25 @@ ${task}
 `;
 }
 
+function buildRalphPrompt(state, taskContent, isReflection) {
+  const maxStr = state.maxIterations > 0 ? `/${state.maxIterations}` : "";
+  const header = `RALPH LOOP: ${state.name} | Iteration ${state.iteration}${maxStr}${isReflection ? " | REFLECTION" : ""}`;
+  const parts = [header, "", `## Current Task (from ${state.taskFile})`, "", taskContent, "---"];
+  if (isReflection) parts.push("## Reflection Checkpoint", "", state.reflectInstructions || "Reflect on progress, blockers, and next priorities.", "---");
+  parts.push("## Stale Prompt Guard", "", STALE_PROMPT_GUARD, "");
+  parts.push("## Completion Gate", "", COMPLETION_GATE, "");
+  parts.push("## Instructions", "");
+  parts.push("This prompt was queued by pi-ralph-swarm for Pi/Ralph follow-up delivery. Do not treat queue creation as task execution.");
+  parts.push(`You are in a Ralph loop (iteration ${state.iteration}${maxStr}).`);
+  if (state.itemsPerIteration > 0) {
+    parts.push(`Process approximately ${state.itemsPerIteration} item(s), update ${state.taskFile}, then call ralph_done unless the completion gate is satisfied.`);
+  } else {
+    parts.push(`Continue the task, update ${state.taskFile}, then call ralph_done unless the completion gate is satisfied.`);
+  }
+  parts.push(`When fully complete and the completion gate is satisfied, respond with: ${COMPLETE_MARKER}`);
+  return `${parts.join("\n")}\n`;
+}
+
 function commandStart(cwd, args) {
   const id = sanitize(value(args, "--name"));
   if (!id) throw new Error("start requires --name <id>");
@@ -308,6 +348,55 @@ function commandAgentStatus(cwd, args, status) {
   return `${agent.id}: ${status}`;
 }
 
+function commandEnqueue(cwd, args) {
+  const agentId = value(args, "--agent");
+  if (!agentId) throw new Error("enqueue requires --agent <id>");
+  const agent = syncAgent(cwd, loadAgent(cwd, agentId));
+  const run = loadRun(cwd, agent.runId);
+  const stateFile = loopStatePath(cwd, agent.loopName);
+  if (!fs.existsSync(stateFile)) throw new Error(`Ralph state not found for ${agent.loopName}`);
+  const state = readJson(stateFile);
+  if (state.status === "completed") throw new Error(`Ralph loop is completed: ${agent.loopName}`);
+  if (state.status === "paused" && has(args, "--activate")) {
+    state.status = "active";
+    state.active = true;
+  }
+  const taskPath = path.resolve(cwd, state.taskFile || agent.taskFile);
+  if (!fs.existsSync(taskPath)) throw new Error(`Ralph task file not found: ${path.relative(cwd, taskPath)}`);
+  const isReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0 && state.iteration !== state.lastReflectionAt;
+  if (isReflection) state.lastReflectionAt = state.iteration;
+  const prompt = buildRalphPrompt(state, fs.readFileSync(taskPath, "utf8"), isReflection);
+  const queuedAt = nowIso();
+  const base = queueBase(cwd, agent.id, queuedAt);
+  const promptPath = `${base}.prompt.md`;
+  const recordPath = `${base}.json`;
+  ensureDir(promptPath);
+  fs.writeFileSync(promptPath, prompt, "utf8");
+  writeJson(recordPath, {
+    id: path.basename(base),
+    runId: run.id,
+    agentId: agent.id,
+    loopName: agent.loopName,
+    status: "queued",
+    delivery: "pi-ralph-followup",
+    queuedAt,
+    promptFile: path.relative(cwd, promptPath),
+    stateFile: path.relative(cwd, stateFile),
+    taskFile: path.relative(cwd, taskPath),
+    note: "Queue record only. Pi/Ralph must deliver this prompt; pi-ralph-swarm did not execute the agent.",
+  });
+  state.queuedAt = queuedAt;
+  state.queueFile = path.relative(cwd, recordPath);
+  writeJson(stateFile, state);
+  agent.status = "queued";
+  agent.lastQueueFile = path.relative(cwd, recordPath);
+  agent.updatedAt = queuedAt;
+  writeJson(agentPath(cwd, agent.id), agent);
+  run.updatedAt = queuedAt;
+  writeJson(runPath(cwd, run.id), run);
+  return `${agent.id}: queued for Pi/Ralph follow-up\nrecord: ${path.relative(cwd, recordPath)}\nprompt: ${path.relative(cwd, promptPath)}`;
+}
+
 function resolveGitDir(cwd) {
   const dotGit = path.join(cwd, ".git");
   if (!fs.existsSync(dotGit)) throw new Error("No .git directory found in current working directory");
@@ -389,6 +478,7 @@ Commands:
   status [--run ID]
   agents --run ID
   collect --agent ID
+  enqueue --agent ID [--activate]
   decision --run ID --text TEXT [--rationale TEXT]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
@@ -413,6 +503,7 @@ function main() {
     const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
     return fs.readFileSync(path.join(cwd, agent.taskFile), "utf8");
   }
+  if (command === "enqueue") return commandEnqueue(cwd, args);
   if (command === "decision") return commandRecord(cwd, args, "decision");
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");

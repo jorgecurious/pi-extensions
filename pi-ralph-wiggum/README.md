@@ -155,6 +155,7 @@ For non-Pi agents or MCP-style evals, the package also ships a small dependency-
 ```bash
 pi-ralph-swarm start --name metal-pr-review --goal "Resolve PR review comments"
 pi-ralph-swarm spawn --run metal-pr-review --role verifier --mode verifier --task "Run focused tests"
+pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm status --run metal-pr-review
 pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm doctor --run metal-pr-review --fix
@@ -162,7 +163,9 @@ pi-ralph-swarm doctor --run metal-pr-review --fix
 
 Use `pi-ralph-swarm ignore` in a worktree to add `.ralph/` to `.git/info/exclude`. This keeps local swarm state available to agents without risking accidental commits to upstreamable branches.
 
-The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It does not queue Pi follow-up prompts; it is a local state/control shim for external agents and workflow tests.
+The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
+
+Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for an agent. The CLI writes `.ralph/swarm/queue/*.json` and `.prompt.md` records and marks the agent `queued`; Pi/Ralph still owns actual prompt delivery and execution. Queue creation is never reported as completed work.
 
 Use `pi-ralph-swarm doctor` to detect duplicate or non-canonical local agent state files after manual edits or older CLI runs. Add `--fix` to rewrite canonical records and remove stale duplicates.
 

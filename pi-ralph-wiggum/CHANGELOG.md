@@ -6,6 +6,7 @@
 - Add swarm mode: a lightweight Ralph-backed subagent control plane with `/swarm` commands, `swarm_*` tools, run/agent state under `.ralph/swarm/`, cognitive-load scoring, scoped task files, and decision/blocker recording.
 - Add `pi-ralph-swarm`, a dependency-free CLI shim for external agents and MCP-style evals to create, inspect, collect, and locally ignore Ralph swarm state.
 - Add `pi-ralph-swarm doctor` to detect and repair duplicate or non-canonical local swarm agent state files.
+- Add `pi-ralph-swarm enqueue` to write Pi/Ralph-compatible follow-up prompt queue records without executing external runners.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
