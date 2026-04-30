@@ -157,11 +157,14 @@ pi-ralph-swarm start --name metal-pr-review --goal "Resolve PR review comments"
 pi-ralph-swarm spawn --run metal-pr-review --role verifier --mode verifier --task "Run focused tests"
 pi-ralph-swarm status --run metal-pr-review
 pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
+pi-ralph-swarm doctor --run metal-pr-review --fix
 ```
 
 Use `pi-ralph-swarm ignore` in a worktree to add `.ralph/` to `.git/info/exclude`. This keeps local swarm state available to agents without risking accidental commits to upstreamable branches.
 
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It does not queue Pi follow-up prompts; it is a local state/control shim for external agents and workflow tests.
+
+Use `pi-ralph-swarm doctor` to detect duplicate or non-canonical local agent state files after manual edits or older CLI runs. Add `--fix` to rewrite canonical records and remove stale duplicates.
 
 ### Options for start
 

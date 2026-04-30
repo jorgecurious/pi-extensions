@@ -47,7 +47,7 @@ function loopTaskPath(cwd, loopName) {
 
 function listFiles(dir, suffix) {
   if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((file) => file.endsWith(suffix));
+  return fs.readdirSync(dir).filter((file) => file.endsWith(suffix)).sort();
 }
 
 function loadRun(cwd, runId) {
@@ -66,10 +66,23 @@ function listRuns(cwd) {
   return listFiles(path.join(cwd, SWARM_DIR), ".run.json").map((file) => readJson(path.join(cwd, SWARM_DIR, file)));
 }
 
+function agentTimestamp(agent) {
+  return Date.parse(agent.updatedAt || agent.createdAt || "") || 0;
+}
+
+function listAgentRecords(cwd) {
+  const dir = path.join(cwd, SWARM_DIR);
+  return listFiles(dir, ".agent.json").map((file) => ({ file, filePath: path.join(dir, file), agent: readJson(path.join(dir, file)) }));
+}
+
 function listAgents(cwd, runId) {
-  return listFiles(path.join(cwd, SWARM_DIR), ".agent.json")
-    .map((file) => readJson(path.join(cwd, SWARM_DIR, file)))
-    .filter((agent) => !runId || agent.runId === sanitize(runId));
+  const byId = new Map();
+  for (const { agent } of listAgentRecords(cwd)) {
+    if (runId && agent.runId !== sanitize(runId)) continue;
+    const existing = byId.get(agent.id);
+    if (!existing || agentTimestamp(agent) > agentTimestamp(existing)) byId.set(agent.id, agent);
+  }
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function syncAgent(cwd, agent) {
@@ -324,6 +337,49 @@ function commandIgnore(cwd) {
   return "Added .ralph/ to .git/info/exclude";
 }
 
+function commandDoctor(cwd, args) {
+  const fix = has(args, "--fix");
+  const runId = value(args, "--run");
+  const recordsById = new Map();
+  for (const record of listAgentRecords(cwd)) {
+    if (runId && record.agent.runId !== sanitize(runId)) continue;
+    const id = record.agent.id;
+    recordsById.set(id, [...(recordsById.get(id) || []), record]);
+  }
+
+  const lines = [];
+  for (const [id, records] of recordsById.entries()) {
+    const canonicalPath = agentPath(cwd, id);
+    const nonCanonical = records.filter((record) => path.resolve(record.filePath) !== path.resolve(canonicalPath));
+    if (records.length <= 1 && nonCanonical.length === 0) continue;
+    const sorted = [...records].sort((a, b) => agentTimestamp(b.agent) - agentTimestamp(a.agent));
+    const keep = sorted[0];
+    lines.push(`${id}: ${records.length} record(s), canonical=${path.relative(cwd, canonicalPath)}`);
+    if (fix) {
+      writeJson(canonicalPath, keep.agent);
+      for (const record of records) {
+        if (path.resolve(record.filePath) !== path.resolve(canonicalPath)) fs.unlinkSync(record.filePath);
+      }
+    }
+  }
+
+  for (const run of listRuns(cwd)) {
+    if (runId && run.id !== sanitize(runId)) continue;
+    const ids = [...new Set((run.agentIds || []).filter(Boolean))];
+    if (ids.length !== (run.agentIds || []).length) {
+      lines.push(`${run.id}: duplicate agentIds in run state`);
+      if (fix) {
+        run.agentIds = ids;
+        run.updatedAt = nowIso();
+        writeJson(runPath(cwd, run.id), run);
+      }
+    }
+  }
+
+  if (lines.length === 0) return "No swarm state issues found.";
+  return `${fix ? "Fixed" : "Found"} swarm state issues:\n${lines.join("\n")}`;
+}
+
 function usage() {
   return `Usage: pi-ralph-swarm <command> [options]
 
@@ -337,6 +393,7 @@ Commands:
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
   complete-agent --agent ID
+  doctor [--run ID] [--fix]
   ignore
 `;
 }
@@ -360,6 +417,7 @@ function main() {
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");
   if (command === "complete-agent") return commandAgentStatus(cwd, args, "completed");
+  if (command === "doctor") return commandDoctor(cwd, args);
   if (command === "ignore") return commandIgnore(cwd);
   throw new Error(`Unknown command: ${command}\n${usage()}`);
 }
