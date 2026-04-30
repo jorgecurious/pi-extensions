@@ -7,6 +7,12 @@
   "keywords": [
     "pi-package"
   ],
+  "bin": {
+    "pi-ralph-swarm": "swarm-cli.mjs"
+  },
+  "scripts": {
+    "check": "npx --yes -p typescript tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --noImplicitAny false index.ts typecheck-stubs.d.ts && node --check swarm-cli.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tmustier/pi-extensions.git",

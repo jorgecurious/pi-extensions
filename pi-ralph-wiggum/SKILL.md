@@ -58,6 +58,8 @@ swarm_spawn_agent({
 
 Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
 
+Outside Pi, use the `pi-ralph-swarm` CLI shim to manipulate the same state files. Run `pi-ralph-swarm ignore` inside a repository before dogfooding swarm state so `.ralph/` is excluded locally via `.git/info/exclude` instead of being committed.
+
 Main assistant responsibilities in swarm mode:
 
 - Keep final authority over edits, commits, pushes, and PR updates.
@@ -65,6 +67,7 @@ Main assistant responsibilities in swarm mode:
 - Pause spawning when load is high or critical.
 - Collect and summarize subagent evidence before acting.
 - Run or delegate final verification before completion.
+- Keep `.ralph/` local unless the user explicitly asks to commit workflow state.
 
 ## Loop Behavior
 

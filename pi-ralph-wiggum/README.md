@@ -148,6 +148,21 @@ Recommended pattern:
 - One main integrator with final authority over edits, commits, pushes, and PR updates.
 - Verification after integration before completion.
 
+### CLI shim
+
+For non-Pi agents or MCP-style evals, the package also ships a small dependency-free CLI:
+
+```bash
+pi-ralph-swarm start --name metal-pr-review --goal "Resolve PR review comments"
+pi-ralph-swarm spawn --run metal-pr-review --role verifier --mode verifier --task "Run focused tests"
+pi-ralph-swarm status --run metal-pr-review
+pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
+```
+
+Use `pi-ralph-swarm ignore` in a worktree to add `.ralph/` to `.git/info/exclude`. This keeps local swarm state available to agents without risking accidental commits to upstreamable branches.
+
+The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It does not queue Pi follow-up prompts; it is a local state/control shim for external agents and workflow tests.
+
 ### Options for start
 
 | Option | Description |
