@@ -9,6 +9,7 @@
 - Add `pi-ralph-swarm enqueue` to write Pi/Ralph-compatible follow-up prompt queue records without executing external runners.
 - Add Pi-side swarm queue listing/draining via `/swarm queue`, `/swarm drain`, `swarm_list_queue`, and `swarm_drain_queue`.
 - Add `pi-ralph-swarm queue` for local inspection of queued, delivered, stale, or failed prompt records.
+- Add `pi-ralph-swarm pi-queue` and `pi-ralph-swarm delegate` to invoke the local extension through the installed Pi runtime with Kimi coding defaults from non-interactive environments.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.

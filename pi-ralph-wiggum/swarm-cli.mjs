@@ -2,10 +2,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const RALPH_DIR = ".ralph";
 const SWARM_DIR = path.join(RALPH_DIR, "swarm");
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
+const CLI_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PI_MODEL = "kimi-coding/kimi-for-coding";
 
 const COMPLETION_GATE = `COMPLETION GATE
 
@@ -431,6 +435,81 @@ function commandQueue(cwd, args) {
     .join("\n");
 }
 
+function piRuntimeOptions(cwd, args, toolName, params, prompt) {
+  const piBin = value(args, "--pi", process.env.PI_RALPH_SWARM_PI || "pi");
+  const model = value(args, "--model", process.env.PI_RALPH_SWARM_MODEL || DEFAULT_PI_MODEL);
+  const extension = path.resolve(cwd, value(args, "--extension", path.join(CLI_DIR, "index.ts")));
+  const tools = value(args, "--tools");
+  const piArgs = ["--model", model, "--extension", extension];
+  if (!has(args, "--session")) piArgs.push("--no-session");
+  if (tools) {
+    piArgs.push("--tools", tools);
+  } else if (toolName === "swarm_list_queue") {
+    piArgs.push("--no-builtin-tools", "--tools", toolName);
+  } else {
+    piArgs.push(
+      "--tools",
+      [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "ralph_done",
+        "swarm_drain_queue",
+        "swarm_list_queue",
+        "swarm_status",
+        "swarm_collect",
+        "swarm_record_blocker",
+      ].join(","),
+    );
+  }
+  piArgs.push("-p", prompt || `Call ${toolName} exactly once with these JSON parameters: ${JSON.stringify(params)}. Return only the tool text output.`);
+  return { piBin, piArgs };
+}
+
+function runPiRuntimeTool(cwd, args, toolName, params, prompt) {
+  const { piBin, piArgs } = piRuntimeOptions(cwd, args, toolName, params, prompt);
+  if (has(args, "--dry-run")) return `${piBin} ${piArgs.map((arg) => JSON.stringify(arg)).join(" ")}`;
+  const result = spawnSync(piBin, piArgs, {
+    cwd,
+    env: process.env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const output = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join("\n");
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Pi runtime tool invocation failed with exit code ${result.status}${output ? `\n${output}` : ""}`);
+  return output;
+}
+
+function commandPiQueue(cwd, args) {
+  const params = {
+    runId: value(args, "--run"),
+    agentId: value(args, "--agent"),
+    status: value(args, "--status"),
+  };
+  for (const key of Object.keys(params)) if (params[key] === undefined) delete params[key];
+  return runPiRuntimeTool(cwd, args, "swarm_list_queue", params);
+}
+
+function commandDelegate(cwd, args) {
+  const params = {
+    runId: value(args, "--run"),
+    agentId: value(args, "--agent"),
+    limit: Number(value(args, "--limit", "1")),
+  };
+  for (const key of Object.keys(params)) if (params[key] === undefined || Number.isNaN(params[key])) delete params[key];
+  const prompt = [
+    `Call swarm_drain_queue exactly once with these JSON parameters: ${JSON.stringify(params)}.`,
+    "If the tool delivers a Ralph follow-up prompt, continue in this same Pi/Kimi session and follow that prompt.",
+    "Do not report queue creation as completed work. Report final status, evidence, commands run, and blockers.",
+  ].join("\n");
+  return runPiRuntimeTool(cwd, args, "swarm_drain_queue", params, prompt);
+}
+
 function resolveGitDir(cwd) {
   const dotGit = path.join(cwd, ".git");
   if (!fs.existsSync(dotGit)) throw new Error("No .git directory found in current working directory");
@@ -514,6 +593,8 @@ Commands:
   collect --agent ID
   enqueue --agent ID [--activate]
   queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
+  pi-queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed] [--model MODEL]
+  delegate [--run ID] [--agent ID] [--limit N] [--model MODEL]
   decision --run ID --text TEXT [--rationale TEXT]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
@@ -540,6 +621,8 @@ function main() {
   }
   if (command === "enqueue") return commandEnqueue(cwd, args);
   if (command === "queue") return commandQueue(cwd, args);
+  if (command === "pi-queue") return commandPiQueue(cwd, args);
+  if (command === "delegate") return commandDelegate(cwd, args);
   if (command === "decision") return commandRecord(cwd, args, "decision");
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");
