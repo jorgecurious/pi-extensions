@@ -176,7 +176,7 @@ Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for
 
 Inside Pi, use `/swarm queue` or `swarm_list_queue` to inspect those records, then `/swarm drain` or `swarm_drain_queue` to deliver one queued prompt as a Pi/Ralph follow-up. Delivery marks the queue record `delivered`, activates the loop/agent, and refuses stale records whose loop completed, agent was cancelled, or queue generation no longer matches current state.
 
-Outside an interactive Pi session, use `pi-ralph-swarm pi-queue` to verify the local extension can be loaded by the installed `pi` runtime, or `pi-ralph-swarm delegate` to launch a non-interactive Pi/Kimi session that calls `swarm_drain_queue` and continues with the delivered Ralph prompt. The default model is `kimi-coding/kimi-for-coding`; override it with `--model` or `PI_RALPH_SWARM_MODEL`. Use `--dry-run` to print the generated `pi` invocation without executing it.
+Outside an interactive Pi session, use `pi-ralph-swarm pi-queue` to verify the local extension can be loaded by the installed `pi` runtime, or `pi-ralph-swarm delegate` to launch a non-interactive Pi/Kimi session that calls `swarm_drain_queue` and continues with the delivered Ralph prompt. The default model is `kimi-coding/kimi-for-coding`; override it with `--model` or `PI_RALPH_SWARM_MODEL`. Use `--dry-run` to print the generated `pi` invocation without executing it. Use `--timeout-ms` or `PI_RALPH_SWARM_TIMEOUT_MS` to bound non-interactive delegate runs.
 
 Use `pi-ralph-swarm doctor` to detect duplicate or non-canonical local agent state files after manual edits or older CLI runs. Add `--fix` to rewrite canonical records and remove stale duplicates.
 

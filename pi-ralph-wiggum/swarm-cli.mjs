@@ -440,6 +440,7 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
   const model = value(args, "--model", process.env.PI_RALPH_SWARM_MODEL || DEFAULT_PI_MODEL);
   const extension = path.resolve(cwd, value(args, "--extension", path.join(CLI_DIR, "index.ts")));
   const tools = value(args, "--tools");
+  const timeoutMs = Number(value(args, "--timeout-ms", process.env.PI_RALPH_SWARM_TIMEOUT_MS || "0")) || undefined;
   const piArgs = ["--model", model, "--extension", extension];
   if (!has(args, "--session")) piArgs.push("--no-session");
   if (tools) {
@@ -467,17 +468,18 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
     );
   }
   piArgs.push("-p", prompt || `Call ${toolName} exactly once with these JSON parameters: ${JSON.stringify(params)}. Return only the tool text output.`);
-  return { piBin, piArgs };
+  return { piBin, piArgs, timeoutMs };
 }
 
 function runPiRuntimeTool(cwd, args, toolName, params, prompt) {
-  const { piBin, piArgs } = piRuntimeOptions(cwd, args, toolName, params, prompt);
+  const { piBin, piArgs, timeoutMs } = piRuntimeOptions(cwd, args, toolName, params, prompt);
   if (has(args, "--dry-run")) return `${piBin} ${piArgs.map((arg) => JSON.stringify(arg)).join(" ")}`;
   const result = spawnSync(piBin, piArgs, {
     cwd,
     env: process.env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
   });
   const output = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join("\n");
   if (result.error) throw result.error;
@@ -505,6 +507,8 @@ function commandDelegate(cwd, args) {
   const prompt = [
     `Call swarm_drain_queue exactly once with these JSON parameters: ${JSON.stringify(params)}.`,
     "If the tool delivers a Ralph follow-up prompt, continue in this same Pi/Kimi session and follow that prompt.",
+    "Do at most one Ralph work iteration in this non-interactive delegate invocation.",
+    "If you call ralph_done and a new follow-up is queued, do not continue that next iteration in this same invocation; report the queued next step and stop.",
     "Do not report queue creation as completed work. Report final status, evidence, commands run, and blockers.",
   ].join("\n");
   return runPiRuntimeTool(cwd, args, "swarm_drain_queue", params, prompt);
