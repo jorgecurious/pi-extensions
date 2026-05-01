@@ -96,6 +96,19 @@ function listAgentRecords(cwd) {
   return listFiles(dir, ".agent.json").map((file) => ({ file, filePath: path.join(dir, file), agent: readJson(path.join(dir, file)) }));
 }
 
+function listQueueRecords(cwd, filters = {}) {
+  const dir = path.join(cwd, SWARM_DIR, "queue");
+  return listFiles(dir, ".json")
+    .map((file) => readJson(path.join(dir, file)))
+    .filter((record) => {
+      if (filters.runId && record.runId !== sanitize(filters.runId)) return false;
+      if (filters.agentId && record.agentId !== sanitize(filters.agentId)) return false;
+      if (filters.status && record.status !== filters.status) return false;
+      return true;
+    })
+    .sort((a, b) => String(a.queuedAt || "").localeCompare(String(b.queuedAt || "")));
+}
+
 function listAgents(cwd, runId) {
   const byId = new Map();
   for (const { agent } of listAgentRecords(cwd)) {
@@ -151,11 +164,13 @@ function cognitiveLoad(cwd, run) {
 function renderBoard(cwd, run) {
   const load = cognitiveLoad(cwd, run);
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
+  const queued = listQueueRecords(cwd, { runId: run.id, status: "queued" }).length;
   const lines = [
     `Swarm: ${run.id} (${run.status})`,
     `Goal: ${run.goal || "(none recorded)"}`,
     `Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
   ];
+  if (queued > 0) lines.push(`Queue: ${queued} queued prompt(s)`);
   if (run.constraints?.length) lines.push(`Constraints: ${run.constraints.join("; ")}`);
   lines.push("Agents:");
   if (agents.length === 0) lines.push("- none");
@@ -361,6 +376,7 @@ function commandEnqueue(cwd, args) {
     state.status = "active";
     state.active = true;
   }
+  state.queueGeneration = Number(state.queueGeneration || 0) + 1;
   const taskPath = path.resolve(cwd, state.taskFile || agent.taskFile);
   if (!fs.existsSync(taskPath)) throw new Error(`Ralph task file not found: ${path.relative(cwd, taskPath)}`);
   const isReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0 && state.iteration !== state.lastReflectionAt;
@@ -373,12 +389,14 @@ function commandEnqueue(cwd, args) {
   ensureDir(promptPath);
   fs.writeFileSync(promptPath, prompt, "utf8");
   writeJson(recordPath, {
+    schemaVersion: 1,
     id: path.basename(base),
     runId: run.id,
     agentId: agent.id,
     loopName: agent.loopName,
     status: "queued",
     delivery: "pi-ralph-followup",
+    queueGeneration: state.queueGeneration,
     queuedAt,
     promptFile: path.relative(cwd, promptPath),
     stateFile: path.relative(cwd, stateFile),
@@ -395,6 +413,22 @@ function commandEnqueue(cwd, args) {
   run.updatedAt = queuedAt;
   writeJson(runPath(cwd, run.id), run);
   return `${agent.id}: queued for Pi/Ralph follow-up\nrecord: ${path.relative(cwd, recordPath)}\nprompt: ${path.relative(cwd, promptPath)}`;
+}
+
+function commandQueue(cwd, args) {
+  const records = listQueueRecords(cwd, {
+    runId: value(args, "--run"),
+    agentId: value(args, "--agent"),
+    status: value(args, "--status"),
+  });
+  if (records.length === 0) return "No swarm queue records.";
+  return records
+    .map((record) => {
+      const delivered = record.deliveredAt ? ` delivered=${record.deliveredAt}` : "";
+      const failure = record.failureReason ? ` failure=${record.failureReason}` : "";
+      return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration ?? 0}, queued=${record.queuedAt}${delivered}${failure}`;
+    })
+    .join("\n");
 }
 
 function resolveGitDir(cwd) {
@@ -479,6 +513,7 @@ Commands:
   agents --run ID
   collect --agent ID
   enqueue --agent ID [--activate]
+  queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
   decision --run ID --text TEXT [--rationale TEXT]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
@@ -504,6 +539,7 @@ function main() {
     return fs.readFileSync(path.join(cwd, agent.taskFile), "utf8");
   }
   if (command === "enqueue") return commandEnqueue(cwd, args);
+  if (command === "queue") return commandQueue(cwd, args);
   if (command === "decision") return commandRecord(cwd, args, "decision");
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");

@@ -94,6 +94,8 @@ Swarm mode stores top-level run and subagent metadata under `.ralph/swarm/` whil
 | `/swarm pause [run]` | Pause run metadata |
 | `/swarm resume [run]` | Resume run metadata |
 | `/swarm stop [run]` | Mark the run completed |
+| `/swarm queue [run]` | List queued/delivered prompt records |
+| `/swarm drain [run]` | Deliver one queued prompt into Pi/Ralph follow-up |
 | `/swarm summarize [run]` | Show a compact board |
 
 ### Swarm agent tools
@@ -126,6 +128,8 @@ Additional tools:
 - `swarm_list_agents`: list run agents with statuses and loop names.
 - `swarm_cognitive_load`: return the load score and reasons.
 - `swarm_collect`: read a subagent's task-file evidence.
+- `swarm_list_queue`: list CLI-created prompt queue records.
+- `swarm_drain_queue`: deliver queued prompt records into Pi/Ralph follow-up messages.
 - `swarm_advance_agent`: advance a subagent loop.
 - `swarm_pause_agent`: pause a subagent loop without deleting evidence.
 - `swarm_cancel_agent`: cancel an agent while preserving its task file.
@@ -156,6 +160,7 @@ For non-Pi agents or MCP-style evals, the package also ships a small dependency-
 pi-ralph-swarm start --name metal-pr-review --goal "Resolve PR review comments"
 pi-ralph-swarm spawn --run metal-pr-review --role verifier --mode verifier --task "Run focused tests"
 pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1
+pi-ralph-swarm queue --run metal-pr-review
 pi-ralph-swarm status --run metal-pr-review
 pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm doctor --run metal-pr-review --fix
@@ -166,6 +171,8 @@ Use `pi-ralph-swarm ignore` in a worktree to add `.ralph/` to `.git/info/exclude
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
 
 Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for an agent. The CLI writes `.ralph/swarm/queue/*.json` and `.prompt.md` records and marks the agent `queued`; Pi/Ralph still owns actual prompt delivery and execution. Queue creation is never reported as completed work.
+
+Inside Pi, use `/swarm queue` or `swarm_list_queue` to inspect those records, then `/swarm drain` or `swarm_drain_queue` to deliver one queued prompt as a Pi/Ralph follow-up. Delivery marks the queue record `delivered`, activates the loop/agent, and refuses stale records whose loop completed, agent was cancelled, or queue generation no longer matches current state.
 
 Use `pi-ralph-swarm doctor` to detect duplicate or non-canonical local agent state files after manual edits or older CLI runs. Add `--fix` to rewrite canonical records and remove stale duplicates.
 

@@ -15,6 +15,7 @@ declare module "node:path" {
   export const dirname: any;
   export const extname: any;
   export const join: any;
+  export const relative: any;
   export const resolve: any;
 }
 

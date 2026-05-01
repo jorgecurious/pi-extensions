@@ -56,9 +56,9 @@ swarm_spawn_agent({
 })
 ```
 
-Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
+Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_list_queue` to inspect CLI-created prompt records and `swarm_drain_queue` to deliver one queued prompt into Pi/Ralph follow-up. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
 
-Outside Pi, use the `pi-ralph-swarm` CLI shim to manipulate the same state files. Run `pi-ralph-swarm ignore` inside a repository before dogfooding swarm state so `.ralph/` is excluded locally via `.git/info/exclude` instead of being committed.
+Outside Pi, use the `pi-ralph-swarm` CLI shim to manipulate the same state files. Run `pi-ralph-swarm ignore` inside a repository before dogfooding swarm state so `.ralph/` is excluded locally via `.git/info/exclude` instead of being committed. The CLI can enqueue prompt records, but Pi/Ralph must drain and execute them; queue creation is not task execution.
 
 Main assistant responsibilities in swarm mode:
 

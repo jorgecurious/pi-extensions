@@ -67,12 +67,16 @@ type LoopStatus = "active" | "paused" | "completed";
 type SwarmRunStatus = "active" | "paused" | "completed";
 type SwarmAgentStatus = "queued" | "active" | "paused" | "blocked" | "completed" | "cancelled";
 type SwarmAgentMode = "read-only" | "writer" | "verifier" | "integrator";
+type SwarmQueueStatus = "queued" | "delivered" | "stale" | "failed";
 type CognitiveLoadLevel = "low" | "medium" | "high" | "critical";
 
 interface LoopState {
 	name: string;
 	taskFile: string;
 	iteration: number;
+	queueGeneration?: number;
+	queueFile?: string;
+	queuedAt?: string;
 	maxIterations: number;
 	itemsPerIteration: number; // Prompt hint only - "process N items per turn"
 	reflectEvery: number; // Reflect every N iterations
@@ -127,8 +131,28 @@ interface SwarmAgent {
 	itemsPerIteration: number;
 	reflectEvery: number;
 	lastSummary?: string;
+	lastQueueFile?: string;
 	createdAt: string;
 	updatedAt: string;
+}
+
+interface SwarmQueueRecord {
+	schemaVersion: number;
+	id: string;
+	runId: string;
+	agentId: string;
+	loopName: string;
+	status: SwarmQueueStatus;
+	delivery: "pi-ralph-followup";
+	queueGeneration: number;
+	queuedAt: string;
+	deliveredAt?: string;
+	deliveredBy?: string;
+	failureReason?: string;
+	promptFile: string;
+	stateFile: string;
+	taskFile: string;
+	note?: string;
 }
 
 interface CognitiveLoadReport {
@@ -248,8 +272,10 @@ export default function (pi: ExtensionAPI) {
 	// --- Swarm state management ---
 
 	const swarmDir = (ctx: ExtensionContext) => path.resolve(ctx.cwd, SWARM_DIR);
+	const swarmQueueDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "queue");
 	const swarmRunPath = (ctx: ExtensionContext, runId: string) => path.join(swarmDir(ctx), `${sanitize(runId)}.run.json`);
 	const swarmAgentPath = (ctx: ExtensionContext, agentId: string) => path.join(swarmDir(ctx), `${sanitize(agentId)}.agent.json`);
+	const swarmQueuePath = (ctx: ExtensionContext, queueId: string) => path.join(swarmQueueDir(ctx), `${sanitize(queueId)}.json`);
 
 	function nowIso(): string {
 		return new Date().toISOString();
@@ -294,8 +320,30 @@ export default function (pi: ExtensionAPI) {
 			itemsPerIteration: raw.itemsPerIteration ?? 2,
 			reflectEvery: raw.reflectEvery ?? 5,
 			lastSummary: raw.lastSummary,
+			lastQueueFile: raw.lastQueueFile,
 			createdAt: raw.createdAt || timestamp,
 			updatedAt: raw.updatedAt || timestamp,
+		};
+	}
+
+	function migrateSwarmQueueRecord(raw: Partial<SwarmQueueRecord> & { id: string; runId: string; agentId: string; loopName: string }): SwarmQueueRecord {
+		return {
+			schemaVersion: raw.schemaVersion ?? 1,
+			id: sanitize(raw.id),
+			runId: sanitize(raw.runId),
+			agentId: sanitize(raw.agentId),
+			loopName: sanitize(raw.loopName),
+			status: raw.status || "queued",
+			delivery: raw.delivery || "pi-ralph-followup",
+			queueGeneration: raw.queueGeneration ?? 0,
+			queuedAt: raw.queuedAt || nowIso(),
+			deliveredAt: raw.deliveredAt,
+			deliveredBy: raw.deliveredBy,
+			failureReason: raw.failureReason,
+			promptFile: raw.promptFile || path.join(SWARM_DIR, "queue", `${sanitize(raw.id)}.prompt.md`),
+			stateFile: raw.stateFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.state.json`),
+			taskFile: raw.taskFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.md`),
+			note: raw.note,
 		};
 	}
 
@@ -349,6 +397,37 @@ export default function (pi: ExtensionAPI) {
 			.filter((agent): agent is SwarmAgent => agent !== null && (!runId || agent.runId === sanitize(runId)));
 	}
 
+	function loadSwarmQueueRecord(ctx: ExtensionContext, queueId: string): SwarmQueueRecord | null {
+		const content = tryRead(swarmQueuePath(ctx, queueId));
+		return content ? migrateSwarmQueueRecord(JSON.parse(content)) : null;
+	}
+
+	function saveSwarmQueueRecord(ctx: ExtensionContext, record: SwarmQueueRecord): void {
+		const filePath = swarmQueuePath(ctx, record.id);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(record, null, 2), "utf-8");
+	}
+
+	function listSwarmQueueRecords(ctx: ExtensionContext, filters: { runId?: string; agentId?: string; status?: SwarmQueueStatus } = {}): SwarmQueueRecord[] {
+		const dir = swarmQueueDir(ctx);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				const content = tryRead(path.join(dir, f));
+				return content ? migrateSwarmQueueRecord(JSON.parse(content)) : null;
+			})
+			.filter((record): record is SwarmQueueRecord => {
+				if (!record) return false;
+				if (filters.runId && record.runId !== sanitize(filters.runId)) return false;
+				if (filters.agentId && record.agentId !== sanitize(filters.agentId)) return false;
+				if (filters.status && record.status !== filters.status) return false;
+				return true;
+			})
+			.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+	}
+
 	function latestActiveSwarmRun(ctx: ExtensionContext): SwarmRun | null {
 		const runs = listSwarmRuns(ctx).filter((run) => run.status === "active");
 		if (runs.length === 0) return null;
@@ -369,7 +448,7 @@ export default function (pi: ExtensionAPI) {
 		if (!loop) return agent;
 		if (loop.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
 		else if (loop.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "paused";
-		else if (loop.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "active";
+		else if (loop.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
 		saveSwarmAgent(ctx, agent);
 		return agent;
 	}
@@ -423,11 +502,13 @@ export default function (pi: ExtensionAPI) {
 	function renderSwarmBoard(ctx: ExtensionContext, run: SwarmRun): string {
 		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
 		const load = cognitiveLoad(ctx, run);
+		const queuedCount = listSwarmQueueRecords(ctx, { runId: run.id, status: "queued" }).length;
 		const lines = [
 			`Swarm: ${run.id} (${SWARM_STATUS_ICONS[run.status]} ${run.status})`,
 			`Goal: ${run.goal || "(none recorded)"}`,
 			`Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
 		];
+		if (queuedCount > 0) lines.push(`Queue: ${queuedCount} queued prompt(s)`);
 		if (run.constraints.length > 0) lines.push(`Constraints: ${run.constraints.join("; ")}`);
 		if (agents.length === 0) {
 			lines.push("Agents: none");
@@ -442,6 +523,84 @@ export default function (pi: ExtensionAPI) {
 		if (unresolved.length > 0) lines.push(`Blockers: ${unresolved.map((blocker) => blocker.text).join("; ")}`);
 		if (run.decisions.length > 0) lines.push(`Latest decision: ${run.decisions[run.decisions.length - 1].text}`);
 		return lines.join("\n");
+	}
+
+	function renderSwarmQueue(records: SwarmQueueRecord[]): string {
+		if (records.length === 0) return "No swarm queue records.";
+		return records
+			.map((record) => {
+				const delivered = record.deliveredAt ? ` delivered=${record.deliveredAt}` : "";
+				const failure = record.failureReason ? ` failure=${record.failureReason}` : "";
+				return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration}, queued=${record.queuedAt}${delivered}${failure}`;
+			})
+			.join("\n");
+	}
+
+	function markQueueRecord(ctx: ExtensionContext, record: SwarmQueueRecord, status: SwarmQueueStatus, failureReason?: string): SwarmQueueRecord {
+		record.status = status;
+		if (status === "delivered") {
+			record.deliveredAt = nowIso();
+			record.deliveredBy = "pi-ralph-wiggum";
+		}
+		if (failureReason) record.failureReason = failureReason;
+		saveSwarmQueueRecord(ctx, record);
+		return record;
+	}
+
+	function deliverQueuedSwarmPrompt(ctx: ExtensionContext, record: SwarmQueueRecord): string {
+		if (record.status !== "queued") return `${record.id}: skipped (${record.status})`;
+		if (ctx.hasPendingMessages()) return `${record.id}: pending Pi messages already queued; drain later`;
+
+		const agent = loadSwarmAgent(ctx, record.agentId);
+		if (!agent) {
+			markQueueRecord(ctx, record, "failed", `Agent not found: ${record.agentId}`);
+			return `${record.id}: failed (agent not found)`;
+		}
+		if (agent.status === "cancelled") {
+			markQueueRecord(ctx, record, "stale", `Agent is cancelled: ${agent.id}`);
+			return `${record.id}: stale (agent cancelled)`;
+		}
+
+		const state = loadState(ctx, record.loopName);
+		if (!state) {
+			markQueueRecord(ctx, record, "failed", `Loop state not found: ${record.loopName}`);
+			return `${record.id}: failed (loop state not found)`;
+		}
+		if (state.status === "completed") {
+			markQueueRecord(ctx, record, "stale", `Loop is completed: ${record.loopName}`);
+			return `${record.id}: stale (loop completed)`;
+		}
+		if ((state.queueGeneration ?? 0) !== record.queueGeneration) {
+			markQueueRecord(ctx, record, "stale", `Queue generation mismatch: state=${state.queueGeneration ?? 0}, record=${record.queueGeneration}`);
+			return `${record.id}: stale (queue generation mismatch)`;
+		}
+
+		const promptPath = path.resolve(ctx.cwd, record.promptFile);
+		const prompt = tryRead(promptPath);
+		if (!prompt) {
+			markQueueRecord(ctx, record, "failed", `Prompt file not found: ${record.promptFile}`);
+			return `${record.id}: failed (prompt file not found)`;
+		}
+
+		state.status = "active";
+		state.active = true;
+		saveState(ctx, state);
+		agent.status = "active";
+		agent.lastQueueFile = path.relative(ctx.cwd, swarmQueuePath(ctx, record.id));
+		saveSwarmAgent(ctx, agent);
+		const run = loadSwarmRun(ctx, record.runId);
+		if (run) {
+			currentSwarm = run.id;
+			saveSwarmRun(ctx, run);
+		}
+		currentLoop = state.name;
+		pi.sendUserMessage(prompt, {
+			deliverAs: "followUp",
+			streamingBehavior: "followUp",
+		});
+		markQueueRecord(ctx, record, "delivered");
+		updateUI(ctx);
+		return `${record.id}: delivered to Pi/Ralph follow-up`;
 	}
 
 	function buildSwarmAgentTaskContent(
@@ -999,6 +1158,8 @@ Commands:
   /swarm pause [run]               Pause run metadata
   /swarm resume [run]              Resume run metadata
   /swarm stop [run]                Mark run completed
+  /swarm queue [run]               List queued/delivered prompt records
+  /swarm drain [run]               Deliver one queued prompt into Pi/Ralph
   /swarm summarize [run]           Show compact board
 
 Agents should use the swarm_* tools for structured orchestration.`;
@@ -1078,6 +1239,26 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			if (currentSwarm === run.id) currentSwarm = null;
 			updateUI(ctx);
 			ctx.ui.notify(`Completed swarm: ${run.id}`, "info");
+		},
+
+		queue(rest, ctx) {
+			const runId = rest.trim() || undefined;
+			const run = loadTargetSwarmRun(ctx, runId);
+			if (runId && !run) return ctx.ui.notify("No swarm run found.", "warning");
+			const records = listSwarmQueueRecords(ctx, run ? { runId: run.id } : {});
+			ctx.ui.notify(renderSwarmQueue(records), records.length > 0 ? "info" : "warning");
+		},
+
+		drain(rest, ctx) {
+			const runId = rest.trim() || undefined;
+			const run = loadTargetSwarmRun(ctx, runId);
+			if (runId && !run) return ctx.ui.notify("No swarm run found.", "warning");
+			const records = listSwarmQueueRecords(ctx, { runId: run?.id, status: "queued" });
+			if (records.length === 0) {
+				ctx.ui.notify("No queued swarm prompts.", "warning");
+				return;
+			}
+			ctx.ui.notify(deliverQueuedSwarmPrompt(ctx, records[0]), "info");
 		},
 
 		summarize(rest, ctx) {
@@ -1389,6 +1570,50 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			return {
 				content: [{ type: "text", text: `Agent: ${synced.id}\nStatus: ${synced.status}\nLoop: ${synced.loopName}\n\n${task}` }],
 				details: { agentId: synced.id, status: synced.status },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_list_queue",
+		label: "List Swarm Queue",
+		description: "List CLI-created swarm prompt queue records awaiting Pi/Ralph delivery.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String()),
+			agentId: Type.Optional(Type.String()),
+			status: Type.Optional(Type.Union([Type.Literal("queued"), Type.Literal("delivered"), Type.Literal("stale"), Type.Literal("failed")])),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const records = listSwarmQueueRecords(ctx, {
+				runId: params.runId,
+				agentId: params.agentId,
+				status: params.status as SwarmQueueStatus | undefined,
+			});
+			return { content: [{ type: "text", text: renderSwarmQueue(records) }], details: { count: records.length } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_drain_queue",
+		label: "Drain Swarm Queue",
+		description: "Deliver queued swarm prompts into Pi/Ralph follow-up messages. Stops when Pi already has a pending message.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String()),
+			agentId: Type.Optional(Type.String()),
+			limit: Type.Optional(Type.Number({ description: "Maximum queued prompts to deliver", default: 1 })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const records = listSwarmQueueRecords(ctx, { runId: params.runId, agentId: params.agentId, status: "queued" });
+			const limit = Math.max(1, params.limit ?? 1);
+			const results: string[] = [];
+			for (const record of records.slice(0, limit)) {
+				const result = deliverQueuedSwarmPrompt(ctx, record);
+				results.push(result);
+				if (result.includes("pending Pi messages") || result.includes("delivered")) break;
+			}
+			return {
+				content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No queued swarm prompts." }],
+				details: { delivered: results.filter((result) => result.includes("delivered")).length, checked: results.length },
 			};
 		},
 	});
