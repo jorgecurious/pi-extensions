@@ -12,6 +12,7 @@
 - Add `pi-ralph-swarm pi-queue` and `pi-ralph-swarm delegate` to invoke the local extension through the installed Pi runtime with Kimi coding defaults from non-interactive environments.
 - Add durable swarm escalations via `swarm_escalate`, `swarm_list_escalations`, `swarm_resolve_escalation`, and matching `pi-ralph-swarm` CLI commands.
 - Add manager-side swarm advice via `swarm_advise`, `/swarm advise`, and `pi-ralph-swarm advise` without introducing advisor agents.
+- Add explicit completed-loop continuation via `/ralph resume`, `swarm_continue_agent`, `pi-ralph-swarm continue-agent`, and `pi-ralph-swarm enqueue --continue-completed`.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
@@ -19,6 +20,9 @@
 - Add a stale-prompt guard instructing agents to reload loop state and ignore already-completed loops instead of doing duplicate work.
 - Bound non-interactive `pi-ralph-swarm delegate` dogfood runs to one Ralph work iteration and add a `--timeout-ms`/`PI_RALPH_SWARM_TIMEOUT_MS` escape hatch.
 - Count open escalations in swarm cognitive load; high-severity escalations block agents by default until the orchestrator resolves them.
+- Count only non-terminal agents against the swarm max-agent budget so completed/cancelled historical agents do not create noisy budget warnings.
+- Centralize advisor-role reservation so terminal `advisor` roles are rejected while scoped roles such as `advisor-scout` remain valid.
+- Extend `pi-ralph-swarm doctor` to flag and optionally relabel legacy terminal advisor-role metadata.
 
 ## 0.2.0 - 2026-04-19
 

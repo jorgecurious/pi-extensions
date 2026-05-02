@@ -56,7 +56,7 @@ swarm_spawn_agent({
 })
 ```
 
-Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_advise` as a manager-side diagnostic before spawning more agents or after collecting evidence; it returns ephemeral recommendations and must not be used as an advisor-agent replacement. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_list_queue` to inspect CLI-created prompt records and `swarm_drain_queue` to deliver one queued prompt into Pi/Ralph follow-up. Use `swarm_escalate` when an agent needs orchestrator guidance before continuing; high-severity escalations block the agent by default. Use `swarm_list_escalations` and `swarm_resolve_escalation` to review and record orchestrator decisions. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
+Use `swarm_status` to inspect the board and cognitive-load score. Use `swarm_advise` as a manager-side diagnostic before spawning more agents or after collecting evidence; it returns ephemeral recommendations and must not be used as an advisor-agent replacement. Use `swarm_list_agents` and `swarm_collect` to read subagent state and task-file evidence. Use `swarm_list_queue` to inspect CLI-created prompt records and `swarm_drain_queue` to deliver one queued prompt into Pi/Ralph follow-up. Use `swarm_continue_agent` when the manager intentionally appends new work to a completed subagent loop; stale completed prompts should still be ignored unless the loop was explicitly continued. Use `swarm_escalate` when an agent needs orchestrator guidance before continuing; high-severity escalations block the agent by default. Use `swarm_list_escalations` and `swarm_resolve_escalation` to review and record orchestrator decisions. Use `swarm_pause_agent` or `swarm_cancel_agent` to reduce load without deleting evidence. Use `swarm_record_decision` and `swarm_record_blocker` when the integrator makes a decision or hits an unresolved blocker.
 
 Outside Pi, use the `pi-ralph-swarm` CLI shim to manipulate the same state files. Run `pi-ralph-swarm ignore` inside a repository before dogfooding swarm state so `.ralph/` is excluded locally via `.git/info/exclude` instead of being committed. The CLI can enqueue prompt records, but Pi/Ralph must drain and execute them; queue creation is not task execution. When the `pi` CLI is available, `pi-ralph-swarm pi-queue` verifies extension runtime tool invocation and `pi-ralph-swarm delegate` launches a non-interactive Pi/Kimi session to call `swarm_drain_queue` and continue with the delivered Ralph prompt.
 
@@ -64,6 +64,7 @@ Main assistant responsibilities in swarm mode:
 
 - Keep final authority over edits, commits, pushes, and PR updates.
 - Keep the advisor role with the manager/orchestrator; do not spawn advisor agents.
+- Treat roles that end in `advisor` as reserved manager-side roles; use `swarm_advise` instead.
 - Prefer many read-only scout/verifier agents and at most one writer per owned path.
 - Pause spawning when load is high or critical.
 - Treat high-severity escalations as stop-and-review events before more edits.
@@ -94,7 +95,7 @@ Before emitting `<promise>COMPLETE</promise>`:
 
 ## Stale Prompt Guard
 
-Before doing any work from a Ralph prompt, reload `.ralph/<name>.state.json`. If the loop state says `"status": "completed"`, do not edit files, do not run task commands, and do not call `ralph_done`. Reply briefly that the stale prompt was ignored because the loop is already completed.
+Before doing any work from a Ralph prompt, reload `.ralph/<name>.state.json`. If the loop state says `"status": "completed"`, do not edit files, do not run task commands, and do not call `ralph_done`. Reply briefly that the stale prompt was ignored because the loop is already completed. The manager can intentionally continue a completed loop with `/ralph resume`, `swarm_continue_agent`, or `pi-ralph-swarm enqueue --continue-completed`; only then should the next prompt be treated as live work.
 
 ## User Commands
 

@@ -152,8 +152,28 @@ function syncAgent(cwd, agent) {
   return agent;
 }
 
+function isAdvisorAgentRole(role) {
+  const normalized = sanitize(role || "").toLowerCase();
+  const parts = normalized.split(/[-_]+/).filter(Boolean);
+  return normalized === "advisor" || parts[parts.length - 1] === "advisor" || normalized.includes("advisor_agent");
+}
+
+function continueCompletedLoopState(state, activate) {
+  const wasCompleted = state.status === "completed";
+  if (wasCompleted) {
+    state.iteration = Number(state.iteration || 0) + 1;
+    if (state.maxIterations > 0 && state.iteration > state.maxIterations) state.maxIterations = state.iteration;
+    delete state.completedAt;
+    state.continuedAt = nowIso();
+  }
+  state.status = activate ? "active" : "paused";
+  state.active = activate;
+  return wasCompleted;
+}
+
 function cognitiveLoad(cwd, run) {
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
+  const budgetAgents = agents.filter((agent) => agent.status !== "completed" && agent.status !== "cancelled");
   const activeAgents = agents.filter((agent) => agent.status === "active").length;
   const writerAgents = agents.filter((agent) => agent.status === "active" && agent.mode === "writer").length;
   const blockedAgents = agents.filter((agent) => agent.status === "blocked").length;
@@ -168,7 +188,7 @@ function cognitiveLoad(cwd, run) {
   }
   const overlaps = [...owners.values()].filter((value) => value.length > 1).length;
   let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + openEscalations.length * 2 + highEscalations * 2 + overlaps * 2;
-  if (agents.length > (run.maxAgents || 4)) score += agents.length - run.maxAgents;
+  if (budgetAgents.length > (run.maxAgents || 4)) score += budgetAgents.length - (run.maxAgents || 4);
   let level = "low";
   if (score >= 10) level = "critical";
   else if (score >= 7) level = "high";
@@ -181,9 +201,9 @@ function cognitiveLoad(cwd, run) {
   if (openEscalations.length > 0) reasons.push(`${openEscalations.length} open escalation(s)`);
   if (highEscalations > 0) reasons.push(`${highEscalations} high escalation(s)`);
   if (overlaps > 0) reasons.push(`${overlaps} overlapping owned path(s)`);
-  if (agents.length > (run.maxAgents || 4)) reasons.push(`${agents.length}/${run.maxAgents || 4} agent budget exceeded`);
+  if (budgetAgents.length > (run.maxAgents || 4)) reasons.push(`${budgetAgents.length}/${run.maxAgents || 4} non-terminal agent budget exceeded`);
   if (reasons.length === 0) reasons.push("within budget");
-  return { level, score, reasons, activeAgents, writerAgents, blockedAgents };
+  return { level, score, reasons, activeAgents, writerAgents, blockedAgents, budgetAgents: budgetAgents.length, totalAgents: agents.length };
 }
 
 function ownedPathOverlaps(agents) {
@@ -241,6 +261,7 @@ function renderBoard(cwd, run) {
     `Swarm: ${run.id} (${run.status})`,
     `Goal: ${run.goal || "(none recorded)"}`,
     `Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
+    `Budget: ${load.budgetAgents}/${run.maxAgents || 4} non-terminal agent(s), ${load.totalAgents} total`,
   ];
   if (queued > 0) lines.push(`Queue: ${queued} queued prompt(s)`);
   if (openEscalations > 0) lines.push(`Escalations: ${openEscalations} open`);
@@ -365,8 +386,7 @@ function commandSpawn(cwd, args) {
   const run = loadRun(cwd, value(args, "--run"));
   const role = value(args, "--role");
   if (!role) throw new Error("spawn requires --role <role>");
-  const normalizedRole = sanitize(role).toLowerCase();
-  if (normalizedRole === "advisor" || normalizedRole.endsWith("-advisor") || normalizedRole.endsWith("_advisor") || normalizedRole.includes("advisor_agent")) {
+  if (isAdvisorAgentRole(role)) {
     throw new Error("Advisor is manager-side behavior, not a swarm agent role. Use advise instead.");
   }
   const agents = listAgents(cwd, run.id);
@@ -451,6 +471,22 @@ function commandAgentStatus(cwd, args, status) {
   return `${agent.id}: ${status}`;
 }
 
+function commandContinueAgent(cwd, args) {
+  const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
+  const stateFile = loopStatePath(cwd, agent.loopName);
+  if (!fs.existsSync(stateFile)) throw new Error(`Ralph state not found for ${agent.loopName}`);
+  const state = readJson(stateFile);
+  const activate = has(args, "--activate");
+  const changed = continueCompletedLoopState(state, activate);
+  writeJson(stateFile, state);
+  agent.status = state.status;
+  agent.updatedAt = nowIso();
+  writeJson(agentPath(cwd, agent.id), agent);
+  return changed
+    ? `${agent.id}: continued ${activate ? "active" : "paused"} at iteration ${state.iteration}/${state.maxIterations}`
+    : `${agent.id}: ${agent.status} (loop was not completed)`;
+}
+
 function commandEnqueue(cwd, args) {
   const agentId = value(args, "--agent");
   if (!agentId) throw new Error("enqueue requires --agent <id>");
@@ -459,7 +495,12 @@ function commandEnqueue(cwd, args) {
   const stateFile = loopStatePath(cwd, agent.loopName);
   if (!fs.existsSync(stateFile)) throw new Error(`Ralph state not found for ${agent.loopName}`);
   const state = readJson(stateFile);
-  if (state.status === "completed") throw new Error(`Ralph loop is completed: ${agent.loopName}`);
+  if (state.status === "completed") {
+    if (!has(args, "--continue-completed")) {
+      throw new Error(`Ralph loop is completed: ${agent.loopName}. Use --continue-completed to append a new iteration.`);
+    }
+    continueCompletedLoopState(state, has(args, "--activate"));
+  }
   if (state.status === "paused" && has(args, "--activate")) {
     state.status = "active";
     state.active = true;
@@ -756,6 +797,17 @@ function commandDoctor(cwd, args) {
     }
   }
 
+  for (const agent of listAgents(cwd, runId)) {
+    if (!isAdvisorAgentRole(agent.role)) continue;
+    const replacementRole = `${agent.role.replace(/[-_]?advisor$/i, "") || "scout"}-scout`;
+    lines.push(`${agent.id}: terminal advisor role metadata (${agent.role}); use manager-side advise instead`);
+    if (fix) {
+      agent.role = replacementRole;
+      agent.updatedAt = nowIso();
+      writeJson(agentPath(cwd, agent.id), agent);
+    }
+  }
+
   for (const run of listRuns(cwd)) {
     if (runId && run.id !== sanitize(runId)) continue;
     const ids = [...new Set((run.agentIds || []).filter(Boolean))];
@@ -782,7 +834,7 @@ Commands:
   status [--run ID]
   agents --run ID
   collect --agent ID
-  enqueue --agent ID [--activate]
+  enqueue --agent ID [--activate] [--continue-completed]
   queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
   advise [--run ID]
   pi-queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed] [--model MODEL]
@@ -793,6 +845,7 @@ Commands:
   decision --run ID --text TEXT [--rationale TEXT]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
+  continue-agent --agent ID [--activate]
   complete-agent --agent ID
   doctor [--run ID] [--fix]
   ignore
@@ -825,6 +878,7 @@ function main() {
   if (command === "decision") return commandRecord(cwd, args, "decision");
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");
+  if (command === "continue-agent") return commandContinueAgent(cwd, args);
   if (command === "complete-agent") return commandAgentStatus(cwd, args, "completed");
   if (command === "doctor") return commandDoctor(cwd, args);
   if (command === "ignore") return commandIgnore(cwd);
