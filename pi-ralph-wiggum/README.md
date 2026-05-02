@@ -95,6 +95,11 @@ Swarm mode stores top-level run and subagent metadata under `.ralph/swarm/` whil
 | `/swarm resume [run]` | Resume run metadata |
 | `/swarm stop [run]` | Mark the run completed |
 | `/swarm queue [run]` | List queued/delivered prompt records |
+| `/swarm ready [run]` | Show dependency-unblocked queued prompts |
+| `/swarm prune-queue [run]` | Mark stale queued records as stale |
+| `/swarm tasks [run]` | List first-class taskboard records |
+| `/swarm next-task [run] [agent]` | Show dependency-unblocked claimable tasks |
+| `/swarm claim-task <task> <agent>` | Claim a task with a lease |
 | `/swarm drain [run]` | Deliver one queued prompt into Pi/Ralph follow-up |
 | `/swarm advise [run]` | Show manager-side advisor recommendations |
 | `/swarm escalations [run]` | List open/resolved escalation records |
@@ -132,6 +137,13 @@ Additional tools:
 - `swarm_cognitive_load`: return the load score and reasons.
 - `swarm_collect`: read a subagent's task-file evidence.
 - `swarm_list_queue`: list CLI-created prompt queue records.
+- `swarm_next_ready`: show dependency-unblocked queued prompts and paused agents ready to enqueue.
+- `swarm_prune_queue`: mark queued records stale when their agent/loop is terminal or prompt is no longer deliverable.
+- `swarm_create_task`: create a first-class taskboard record with dependencies, path ownership, acceptance criteria, verification commands, and greenlight policy.
+- `swarm_list_tasks`: list taskboard records.
+- `swarm_next_task`: show claimable taskboard records after dependency, lease, and owned-path checks.
+- `swarm_claim_task`: atomically claim a task with a lease.
+- `swarm_checkpoint_task`: attach a proof-bearing checkpoint and move the task to `running`, `review`, `blocked`, `ready`, or `done`.
 - `swarm_drain_queue`: deliver queued prompt records into Pi/Ralph follow-up messages.
 - `swarm_advance_agent`: advance a subagent loop.
 - `swarm_pause_agent`: pause a subagent loop without deleting evidence.
@@ -171,6 +183,14 @@ pi-ralph-swarm spawn-phase --run metal-pr-review --contract roadmap.json --phase
 pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1 --continue-completed --activate
 pi-ralph-swarm queue --run metal-pr-review
+pi-ralph-swarm next-ready --run metal-pr-review
+pi-ralph-swarm prune-queue --run metal-pr-review --dry-run
+pi-ralph-swarm task-create --run metal-pr-review --id fix-docs --lane docs --title "Fix docs drift" --owned docs --acceptance "README is updated" --verify "npm run check" --review-required --worktree-required --worktree ../metal-pr-review-fix-docs
+pi-ralph-swarm task-create --run metal-pr-review --id design-fix-docs --lane docs --title "Design docs fix" --parent-blocked-task fix-docs --unblocks fix-docs --acceptance "Unblock plan recorded"
+pi-ralph-swarm next-task --run metal-pr-review --agent swarm-metal-pr-review-docs-1
+pi-ralph-swarm claim-task --task fix-docs --agent swarm-metal-pr-review-docs-1 --lease-minutes 60
+pi-ralph-swarm checkpoint-task --task fix-docs --state NEEDS_REVIEW --agent swarm-metal-pr-review-docs-1 --file docs/README.md --command "npm run check" --result "Docs updated; check passed"
+pi-ralph-swarm checkpoint-task --task fix-docs --state DONE --agent swarm-metal-pr-review-reviewer-1 --command "npm run check" --result "Review approved"
 pi-ralph-swarm pi-queue --run metal-pr-review
 pi-ralph-swarm delegate --run metal-pr-review --limit 1
 pi-ralph-swarm advise --run metal-pr-review
@@ -200,6 +220,8 @@ Example contract:
       "id": "gdn-artifacts",
       "title": "GDN artifact hardening",
       "goal": "Improve benchmark artifact reliability without changing kernels.",
+      "setupNotes": ["Use python3 -m pytest, not bare pytest."],
+      "verificationEnvironment": ["If this is a fresh worktree, ensure build/lib, build/tvm, and TVM_IMPORT_PYTHON_PATH are available."],
       "agents": [
         {
           "id": "schema-writer",
@@ -212,6 +234,7 @@ Example contract:
           "kind": "verifier",
           "task": "Verify the artifact schema checks and focused benchmark tests.",
           "allowedPaths": ["benchmark/flashqla_metal", "testing/python/metal"],
+          "setupNotes": ["Record any required env vars in the task file before completion."],
           "dependsOn": ["schema-writer"]
         }
       ]
@@ -229,9 +252,38 @@ pi-ralph-swarm spawn-phase --run metal-roadmap --contract roadmap.json --phase g
 
 Agent kinds map to existing modes: `scout` -> `read-only`, `writer` -> `writer`, `debugger` -> `writer`, and `verifier` -> `verifier`. Explicit `mode` may still be one of `read-only`, `writer`, `verifier`, or `integrator`. Hydrated agents are paused by default; pass `--enqueue` to create queue records and `--activate` with `--enqueue` when you want Pi/Ralph to pick them up immediately.
 
+Dependency order is enforced at queue-drain time. `dependsOn` entries are resolved to hydrated agent loop ids; queued prompts whose dependencies are not completed stay queued but are reported as blocked by `/swarm ready`, `swarm_next_ready`, and `pi-ralph-swarm next-ready`. This keeps execution lead-controlled while preventing a verifier from draining before its writer completes.
+
+Contracts may include `setupNotes` and `verificationEnvironment` at the contract, phase, or agent level. These notes are copied into generated task files so verifiers can preserve required build artifacts, env vars, submodule paths, or other monitor-rerunnable setup details.
+
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
 
 Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for an agent. The CLI writes `.ralph/swarm/queue/*.json` and `.prompt.md` records and marks the agent `queued`; Pi/Ralph still owns actual prompt delivery and execution. Queue creation is never reported as completed work. If the loop is already completed, pass `--continue-completed` to append a new iteration intentionally; otherwise completed-loop queue records are rejected to preserve the stale-prompt guard.
+
+Use `pi-ralph-swarm prune-queue` or `swarm_prune_queue` on long-lived boards to mark queued records stale when their agent or loop already completed/cancelled, their queue generation no longer matches, or the prompt file is missing. This is non-destructive; it changes queue status to `stale` and records the reason instead of deleting evidence.
+
+### Taskboard and self-claiming
+
+Taskboard records are the first step toward autonomous self-claiming without giving up lead-controlled safety. They live under `.ralph/swarm/tasks/*.json` and are separate from Ralph loop prompts. A task carries its lane, dependencies, allowed paths, owned paths, acceptance criteria, verification commands, review/worktree policy, greenlight policy, claim lease, and checkpoints.
+
+Task statuses are `backlog`, `ready`, `claimed`, `running`, `review`, `blocked`, `done`, and `stale`. `swarm_next_task` and `pi-ralph-swarm next-task` only report a task claimable when dependencies are `done`, the task is `ready` or has an expired compatible claim, required worktree paths exist, and owned paths do not overlap active `claimed`, `running`, or `review` tasks.
+
+Use `dependsOn` only for prerequisite-success ordering. For work that exists to unblock a blocked parent, use `--parent-blocked-task PARENT --unblocks PARENT` instead. These fields preserve blocker lineage but do not make the child wait for the blocked parent to become `done`.
+
+Claims use a local lock file plus a lease timestamp. If a worker dies, another worker can reclaim after the lease expires. This is deliberately local and boring; it prevents two agents from silently editing the same owned path.
+
+Workers report progress with checkpoints, not free-form success claims:
+
+```text
+STATE: DONE | BLOCKED | NEEDS_INPUT | HANDOFF | IN_PROGRESS | NEEDS_REVIEW
+FILES_CHANGED: exact paths or none
+COMMANDS_RUN: exact commands or none
+RESULT: concrete result/proof
+BLOCKER: blocker or none
+NEXT_ACTION: exact handoff
+```
+
+Implementation tasks should be created with `--review-required --worktree-required --worktree PATH`. Review-required tasks cannot checkpoint `DONE` until they are in `review`, and the agent that requested review cannot close the task. A separate verifier/reviewer should move them to `done`. Tasks marked `greenlightRequired` may prepare commits, branches, or PR bodies, but `DONE` also requires an explicit `--greenlit` checkpoint and externally visible or irreversible actions still require human approval.
 
 Inside Pi, use `/swarm queue` or `swarm_list_queue` to inspect those records, then `/swarm drain` or `swarm_drain_queue` to deliver one queued prompt as a Pi/Ralph follow-up. Delivery marks the queue record `delivered`, activates the loop/agent, and refuses stale records whose loop completed, agent was cancelled, or queue generation no longer matches current state.
 

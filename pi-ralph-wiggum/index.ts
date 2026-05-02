@@ -68,9 +68,13 @@ type SwarmRunStatus = "active" | "paused" | "completed";
 type SwarmAgentStatus = "queued" | "active" | "paused" | "blocked" | "completed" | "cancelled";
 type SwarmAgentMode = "read-only" | "writer" | "verifier" | "integrator";
 type SwarmQueueStatus = "queued" | "delivered" | "stale" | "failed";
+type SwarmTaskStatus = "backlog" | "ready" | "claimed" | "running" | "review" | "blocked" | "done" | "stale";
+type SwarmCheckpointState = "DONE" | "BLOCKED" | "NEEDS_INPUT" | "HANDOFF" | "IN_PROGRESS" | "NEEDS_REVIEW";
 type SwarmEscalationSeverity = "low" | "medium" | "high";
 type SwarmEscalationStatus = "open" | "resolved";
 type CognitiveLoadLevel = "low" | "medium" | "high" | "critical";
+
+const SWARM_TASK_STATUSES = new Set<SwarmTaskStatus>(["backlog", "ready", "claimed", "running", "review", "blocked", "done", "stale"]);
 
 interface LoopState {
 	name: string;
@@ -130,6 +134,7 @@ interface SwarmAgent {
 	allowedPaths: string[];
 	ownedPaths: string[];
 	dependencies: string[];
+	setupNotes: string[];
 	maxIterations: number;
 	itemsPerIteration: number;
 	reflectEvery: number;
@@ -156,6 +161,47 @@ interface SwarmQueueRecord {
 	stateFile: string;
 	taskFile: string;
 	note?: string;
+}
+
+interface SwarmTaskCheckpoint {
+	state: SwarmCheckpointState;
+	agentId: string;
+	filesChanged: string[];
+	commandsRun: string[];
+	result?: string;
+	blocker?: string;
+	nextAction?: string;
+	greenlit?: boolean;
+	createdAt: string;
+}
+
+interface SwarmTaskRecord {
+	schemaVersion: number;
+	id: string;
+	runId: string;
+	lane: string;
+	title: string;
+	goal: string;
+	status: SwarmTaskStatus;
+	allowedPaths: string[];
+	ownedPaths: string[];
+	dependencies: string[];
+	unblocks: string[];
+	parentBlockedTask?: string;
+	acceptanceCriteria: string[];
+	verificationCommands: string[];
+	greenlightRequired: boolean;
+	reviewRequired: boolean;
+	worktreeRequired: boolean;
+	worktreePath?: string;
+	reviewRequestedBy?: string;
+	reviewRequestedAt?: string;
+	claimOwner?: string;
+	claimedAt?: string;
+	claimLeaseUntil?: string;
+	checkpoints: SwarmTaskCheckpoint[];
+	createdAt: string;
+	updatedAt: string;
 }
 
 interface SwarmEscalationRecord {
@@ -310,10 +356,13 @@ export default function (pi: ExtensionAPI) {
 
 	const swarmDir = (ctx: ExtensionContext) => path.resolve(ctx.cwd, SWARM_DIR);
 	const swarmQueueDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "queue");
+	const swarmTaskDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "tasks");
 	const swarmEscalationDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "escalations");
 	const swarmRunPath = (ctx: ExtensionContext, runId: string) => path.join(swarmDir(ctx), `${sanitize(runId)}.run.json`);
 	const swarmAgentPath = (ctx: ExtensionContext, agentId: string) => path.join(swarmDir(ctx), `${sanitize(agentId)}.agent.json`);
 	const swarmQueuePath = (ctx: ExtensionContext, queueId: string) => path.join(swarmQueueDir(ctx), `${sanitize(queueId)}.json`);
+	const swarmTaskPath = (ctx: ExtensionContext, taskId: string) => path.join(swarmTaskDir(ctx), `${sanitize(taskId)}.json`);
+	const swarmTaskLockPath = (ctx: ExtensionContext, taskId: string) => path.join(swarmTaskDir(ctx), `${sanitize(taskId)}.lock`);
 	const swarmEscalationPath = (ctx: ExtensionContext, escalationId: string) => path.join(swarmEscalationDir(ctx), `${sanitize(escalationId)}.json`);
 
 	function nowIso(): string {
@@ -355,6 +404,7 @@ export default function (pi: ExtensionAPI) {
 			allowedPaths: normalizeStringList(raw.allowedPaths),
 			ownedPaths: normalizeStringList(raw.ownedPaths),
 			dependencies: normalizeStringList(raw.dependencies),
+			setupNotes: normalizeStringList(raw.setupNotes),
 			maxIterations: raw.maxIterations ?? 20,
 			itemsPerIteration: raw.itemsPerIteration ?? 2,
 			reflectEvery: raw.reflectEvery ?? 5,
@@ -383,6 +433,38 @@ export default function (pi: ExtensionAPI) {
 			stateFile: raw.stateFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.state.json`),
 			taskFile: raw.taskFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.md`),
 			note: raw.note,
+		};
+	}
+
+	function migrateSwarmTaskRecord(raw: Partial<SwarmTaskRecord> & { id: string; runId: string; title?: string; goal?: string }): SwarmTaskRecord {
+		const timestamp = nowIso();
+		return {
+			schemaVersion: raw.schemaVersion ?? 1,
+			id: sanitize(raw.id),
+			runId: sanitize(raw.runId),
+			lane: sanitize(raw.lane || "general"),
+			title: raw.title || raw.goal || raw.id,
+			goal: raw.goal || raw.title || raw.id,
+			status: raw.status || "ready",
+			allowedPaths: normalizeStringList(raw.allowedPaths),
+			ownedPaths: normalizeStringList(raw.ownedPaths),
+			dependencies: normalizeStringList(raw.dependencies),
+			unblocks: normalizeStringList(raw.unblocks),
+			parentBlockedTask: raw.parentBlockedTask,
+			acceptanceCriteria: normalizeStringList(raw.acceptanceCriteria),
+			verificationCommands: normalizeStringList(raw.verificationCommands),
+			greenlightRequired: Boolean(raw.greenlightRequired),
+			reviewRequired: Boolean(raw.reviewRequired),
+			worktreeRequired: Boolean(raw.worktreeRequired),
+			worktreePath: raw.worktreePath,
+			reviewRequestedBy: raw.reviewRequestedBy,
+			reviewRequestedAt: raw.reviewRequestedAt,
+			claimOwner: raw.claimOwner,
+			claimedAt: raw.claimedAt,
+			claimLeaseUntil: raw.claimLeaseUntil,
+			checkpoints: Array.isArray(raw.checkpoints) ? raw.checkpoints : [],
+			createdAt: raw.createdAt || timestamp,
+			updatedAt: raw.updatedAt || timestamp,
 		};
 	}
 
@@ -489,6 +571,39 @@ export default function (pi: ExtensionAPI) {
 			.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
 	}
 
+	function loadSwarmTask(ctx: ExtensionContext, taskId: string): SwarmTaskRecord | null {
+		const content = tryRead(swarmTaskPath(ctx, taskId));
+		return content ? migrateSwarmTaskRecord(JSON.parse(content)) : null;
+	}
+
+	function saveSwarmTask(ctx: ExtensionContext, task: SwarmTaskRecord): void {
+		task.id = sanitize(task.id);
+		task.updatedAt = nowIso();
+		const filePath = swarmTaskPath(ctx, task.id);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(task, null, 2), "utf-8");
+	}
+
+	function listSwarmTasks(ctx: ExtensionContext, filters: { runId?: string; status?: SwarmTaskStatus; lane?: string } = {}): SwarmTaskRecord[] {
+		const dir = swarmTaskDir(ctx);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				const content = tryRead(path.join(dir, f));
+				return content ? migrateSwarmTaskRecord(JSON.parse(content)) : null;
+			})
+			.filter((task): task is SwarmTaskRecord => {
+				if (!task) return false;
+				if (filters.runId && task.runId !== sanitize(filters.runId)) return false;
+				if (filters.status && task.status !== filters.status) return false;
+				if (filters.lane && task.lane !== sanitize(filters.lane)) return false;
+				return true;
+			})
+			.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+	}
+
 	function loadSwarmEscalationRecord(ctx: ExtensionContext, escalationId: string): SwarmEscalationRecord | null {
 		const content = tryRead(swarmEscalationPath(ctx, escalationId));
 		return content ? migrateSwarmEscalationRecord(JSON.parse(content)) : null;
@@ -565,7 +680,7 @@ export default function (pi: ExtensionAPI) {
 		const openEscalations = listSwarmEscalationRecords(ctx, { runId: run.id, status: "open" });
 		const highEscalations = openEscalations.filter((record) => record.severity === "high").length;
 		const pathOwners = new Map<string, string[]>();
-		for (const agent of agents) {
+		for (const agent of budgetAgents) {
 			for (const ownerPath of agent.ownedPaths) {
 				const owners = pathOwners.get(ownerPath) || [];
 				owners.push(agent.id);
@@ -598,7 +713,7 @@ export default function (pi: ExtensionAPI) {
 
 	function ownedPathOverlaps(agents: SwarmAgent[]): Array<[string, string[]]> {
 		const pathOwners = new Map<string, string[]>();
-		for (const agent of agents) {
+		for (const agent of agents.filter((candidate) => candidate.status !== "completed" && candidate.status !== "cancelled")) {
 			for (const ownerPath of agent.ownedPaths) {
 				const owners = pathOwners.get(ownerPath) || [];
 				owners.push(agent.id);
@@ -610,6 +725,14 @@ export default function (pi: ExtensionAPI) {
 
 	function adviseSwarm(ctx: ExtensionContext, run: SwarmRun): SwarmAdvice {
 		const load = cognitiveLoad(ctx, run);
+		if (run.status === "completed") {
+			return {
+				urgency: "low",
+				summary: "completed run: no active roadmap work remains.",
+				recommendations: ["Start or resume a separate run only if new roadmap work is introduced."],
+				load,
+			};
+		}
 		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
 		const activeAgents = agents.filter((agent) => agent.status === "active");
 		const activeWriters = activeAgents.filter((agent) => agent.mode === "writer");
@@ -644,10 +767,72 @@ export default function (pi: ExtensionAPI) {
 		return [`Advice: ${advice.summary}`, ...advice.recommendations.map((item) => `- ${item}`)].join("\n");
 	}
 
+	function swarmDependencyReport(ctx: ExtensionContext, runId: string, agent: SwarmAgent): { ready: boolean; waiting: string[]; satisfied: string[] } {
+		const agents = listSwarmAgents(ctx, runId).map((candidate) => syncSwarmAgentFromLoop(ctx, candidate));
+		const byId = new Map<string, SwarmAgent>();
+		for (const candidate of agents) {
+			byId.set(sanitize(candidate.id), candidate);
+			byId.set(sanitize(candidate.loopName), candidate);
+		}
+		const waiting: string[] = [];
+		const satisfied: string[] = [];
+		for (const dependency of agent.dependencies) {
+			const dependencyAgent = byId.get(sanitize(dependency));
+			if (dependencyAgent?.status === "completed") satisfied.push(dependencyAgent.id);
+			else waiting.push(`${dependency}${dependencyAgent ? ` (${dependencyAgent.status})` : " (missing)"}`);
+		}
+		return { ready: waiting.length === 0, waiting, satisfied };
+	}
+
+	function readySwarmQueueRecords(ctx: ExtensionContext, runId?: string, agentId?: string): SwarmQueueRecord[] {
+		return listSwarmQueueRecords(ctx, { runId, agentId, status: "queued" }).filter((record) => {
+			const agent = loadSwarmAgent(ctx, record.agentId);
+			const synced = agent ? syncSwarmAgentFromLoop(ctx, agent) : null;
+			return synced && ["queued", "paused"].includes(synced.status) ? swarmDependencyReport(ctx, record.runId, synced).ready : false;
+		});
+	}
+
+	function renderSwarmReadyQueue(ctx: ExtensionContext, run: SwarmRun): string {
+		const records = listSwarmQueueRecords(ctx, { runId: run.id, status: "queued" });
+		const lines = [`Ready queue for ${run.id}:`];
+		const ready: string[] = [];
+		const blocked: string[] = [];
+		for (const record of records) {
+			const agent = loadSwarmAgent(ctx, record.agentId);
+			if (!agent) {
+				blocked.push(`${record.agentId}: missing agent`);
+				continue;
+			}
+			const synced = syncSwarmAgentFromLoop(ctx, agent);
+			if (!["queued", "paused"].includes(synced.status)) {
+				blocked.push(`${record.agentId}: not runnable (${synced.status})`);
+				continue;
+			}
+			const report = swarmDependencyReport(ctx, run.id, synced);
+			if (report.ready) ready.push(`${record.agentId}: ${record.id}`);
+			else blocked.push(`${record.agentId}: waiting for ${report.waiting.join(", ")}`);
+		}
+		if (ready.length === 0) lines.push("- none");
+		else for (const item of ready) lines.push(`- ${item}`);
+		if (blocked.length > 0) {
+			lines.push("Blocked queued prompts:");
+			for (const item of blocked) lines.push(`- ${item}`);
+		}
+		const pausedReady = listSwarmAgents(ctx, run.id)
+			.map((agent) => syncSwarmAgentFromLoop(ctx, agent))
+			.filter((agent) => agent.status === "paused" && swarmDependencyReport(ctx, run.id, agent).ready);
+		if (pausedReady.length > 0) {
+			lines.push("Paused agents ready to enqueue:");
+			for (const agent of pausedReady) lines.push(`- ${agent.id}`);
+		}
+		return lines.join("\n");
+	}
+
 	function renderSwarmBoard(ctx: ExtensionContext, run: SwarmRun): string {
 		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
 		const load = cognitiveLoad(ctx, run);
 		const queuedCount = listSwarmQueueRecords(ctx, { runId: run.id, status: "queued" }).length;
+		const readyCount = readySwarmQueueRecords(ctx, run.id).length;
 		const lines = [
 			`Swarm: ${run.id} (${SWARM_STATUS_ICONS[run.status]} ${run.status})`,
 			`Goal: ${run.goal || "(none recorded)"}`,
@@ -655,6 +840,7 @@ export default function (pi: ExtensionAPI) {
 			`Budget: ${load.budgetAgents}/${run.maxAgents} non-terminal agent(s), ${load.totalAgents} total`,
 		];
 		if (queuedCount > 0) lines.push(`Queue: ${queuedCount} queued prompt(s)`);
+		if (readyCount > 0 && readyCount !== queuedCount) lines.push(`Ready: ${readyCount} dependency-unblocked queued prompt(s)`);
 		lines.push(`Advice: ${adviseSwarm(ctx, run).summary}`);
 		if (run.constraints.length > 0) lines.push(`Constraints: ${run.constraints.join("; ")}`);
 		if (agents.length === 0) {
@@ -681,6 +867,228 @@ export default function (pi: ExtensionAPI) {
 				return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration}, queued=${record.queuedAt}${delivered}${failure}`;
 			})
 			.join("\n");
+	}
+
+	function staleSwarmQueueReason(ctx: ExtensionContext, record: SwarmQueueRecord): string | undefined {
+		if (record.status !== "queued") return undefined;
+		const agent = loadSwarmAgent(ctx, record.agentId);
+		if (!agent) return `Agent not found: ${record.agentId}`;
+		const synced = syncSwarmAgentFromLoop(ctx, agent);
+		if (synced.status === "cancelled") return `Agent is cancelled: ${synced.id}`;
+		if (synced.status === "completed") return `Agent is completed: ${synced.id}`;
+		const state = loadState(ctx, record.loopName);
+		if (!state) return `Loop state not found: ${record.loopName}`;
+		if (state.status === "completed") return `Loop is completed: ${record.loopName}`;
+		if ((state.queueGeneration ?? 0) !== record.queueGeneration) return `Queue generation mismatch: state=${state.queueGeneration ?? 0}, record=${record.queueGeneration}`;
+		if (!tryRead(path.resolve(ctx.cwd, record.promptFile))) return `Prompt file not found: ${record.promptFile}`;
+		return undefined;
+	}
+
+	function pruneStaleSwarmQueue(ctx: ExtensionContext, filters: { runId?: string; agentId?: string } = {}, dryRun = false): string {
+		const records = listSwarmQueueRecords(ctx, { ...filters, status: "queued" });
+		const stale = records
+			.map((record) => ({ record, reason: staleSwarmQueueReason(ctx, record) }))
+			.filter((item): item is { record: SwarmQueueRecord; reason: string } => Boolean(item.reason));
+		if (stale.length === 0) return "No stale queued swarm records found.";
+		const lines = [dryRun ? "Would mark stale queued records:" : "Marked stale queued records:"];
+		for (const { record, reason } of stale) {
+			if (!dryRun) markQueueRecord(ctx, record, "stale", reason);
+			lines.push(`- ${record.id}: agent=${record.agentId}, reason=${reason}`);
+		}
+		return lines.join("\n");
+	}
+
+	function swarmPathsOverlap(a: string[] = [], b: string[] = []): boolean {
+		return a.some((left) => b.some((right) => left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)));
+	}
+
+	function swarmTaskBlocksOwnedPath(task: SwarmTaskRecord, timestamp = Date.now()): boolean {
+		if (task.status === "running" || task.status === "review") return true;
+		return task.status === "claimed" && (Date.parse(task.claimLeaseUntil || "") || 0) > timestamp;
+	}
+
+	function swarmTaskDependencyReport(ctx: ExtensionContext, runId: string, task: SwarmTaskRecord): { ready: boolean; waiting: string[]; satisfied: string[] } {
+		const byId = new Map(listSwarmTasks(ctx, { runId }).map((candidate) => [sanitize(candidate.id), candidate]));
+		const waiting: string[] = [];
+		const satisfied: string[] = [];
+		for (const dependency of task.dependencies) {
+			const dependencyTask = byId.get(sanitize(dependency));
+			if (dependencyTask?.status === "done") satisfied.push(dependencyTask.id);
+			else waiting.push(`${dependency}${dependencyTask ? ` (${dependencyTask.status})` : " (missing)"}`);
+		}
+		return { ready: waiting.length === 0, waiting, satisfied };
+	}
+
+	function swarmTaskClaimBlockers(ctx: ExtensionContext, runId: string, task: SwarmTaskRecord, claimantId?: string): string[] {
+		const blockers: string[] = [];
+		const run = loadSwarmRun(ctx, runId);
+		if (!run) blockers.push(`run not found: ${runId}`);
+		else if (run.status !== "active") blockers.push(`run is ${run.status}`);
+		const dependencyReport = swarmTaskDependencyReport(ctx, runId, task);
+		if (!dependencyReport.ready) blockers.push(`waiting for ${dependencyReport.waiting.join(", ")}`);
+		if (task.worktreeRequired) {
+			if (!task.worktreePath) blockers.push("isolated worktree is required but worktreePath is not set");
+			else if (!fs.existsSync(path.resolve(ctx.cwd, task.worktreePath))) blockers.push(`worktree path does not exist: ${task.worktreePath}`);
+		}
+		const now = Date.now();
+		const leaseUntil = Date.parse(task.claimLeaseUntil || "") || 0;
+		if (!["ready", "claimed"].includes(task.status)) blockers.push(`status is ${task.status}`);
+		if (task.status === "claimed" && leaseUntil > now && task.claimOwner !== claimantId) blockers.push(`claimed by ${task.claimOwner} until ${task.claimLeaseUntil}`);
+		const active = listSwarmTasks(ctx, { runId }).filter((candidate) => candidate.id !== task.id && swarmTaskBlocksOwnedPath(candidate, now));
+		for (const candidate of active) {
+			if (swarmPathsOverlap(task.ownedPaths, candidate.ownedPaths)) blockers.push(`owned path overlap with ${candidate.id}`);
+		}
+		return blockers;
+	}
+
+	function renderSwarmTasks(tasks: SwarmTaskRecord[]): string {
+		if (tasks.length === 0) return "No swarm tasks.";
+		return tasks
+			.map((task) => {
+				const owner = task.claimOwner ? ` owner=${task.claimOwner}` : "";
+				const lease = task.claimLeaseUntil ? ` lease=${task.claimLeaseUntil}` : "";
+				const review = task.reviewRequired ? " review-required" : "";
+				const worktree = task.worktreeRequired ? ` worktree=${task.worktreePath || "required"}` : "";
+				const parent = task.parentBlockedTask ? ` parent=${task.parentBlockedTask}` : "";
+				const unblocks = task.unblocks.length > 0 ? ` unblocks=${task.unblocks.join(",")}` : "";
+				return `${task.id}: ${task.status} lane=${task.lane}${owner}${lease}${review}${worktree}${parent}${unblocks} - ${task.title || task.goal}`;
+			})
+			.join("\n");
+	}
+
+	function renderNextSwarmTasks(ctx: ExtensionContext, runId: string, claimantId?: string): string {
+		const ready: SwarmTaskRecord[] = [];
+		const blocked: string[] = [];
+		for (const task of listSwarmTasks(ctx, { runId })) {
+			const blockers = swarmTaskClaimBlockers(ctx, runId, task, claimantId);
+			if (blockers.length === 0) ready.push(task);
+			else if (["ready", "claimed"].includes(task.status)) blocked.push(`${task.id}: ${blockers.join("; ")}`);
+		}
+		const lines = [`Claimable tasks for ${runId}${claimantId ? ` as ${claimantId}` : ""}:`];
+		if (ready.length === 0) lines.push("- none");
+		else for (const task of ready) lines.push(`- ${task.id}: ${task.title || task.goal}`);
+		if (blocked.length > 0) {
+			lines.push("Blocked ready tasks:");
+			for (const item of blocked) lines.push(`- ${item}`);
+		}
+		return lines.join("\n");
+	}
+
+	function withSwarmTaskLock<T>(ctx: ExtensionContext, taskId: string, fn: () => T): T {
+		const lockPath = swarmTaskLockPath(ctx, taskId);
+		ensureDir(lockPath);
+		try {
+			fs.writeFileSync(lockPath, `${nowIso()}\n`, { encoding: "utf-8", flag: "wx" });
+			return fn();
+		} catch (error) {
+			if ((error as { code?: string }).code === "EEXIST") throw new Error(`Task is locked by another claimant: ${taskId}`);
+			throw error;
+		} finally {
+			tryDelete(lockPath);
+		}
+	}
+
+	function createSwarmTask(ctx: ExtensionContext, params: {
+		runId: string;
+		id?: string;
+		title: string;
+		goal?: string;
+		lane?: string;
+		status?: SwarmTaskStatus;
+		allowedPaths?: string[];
+		ownedPaths?: string[];
+		dependencies?: string[];
+		unblocks?: string[];
+		parentBlockedTask?: string;
+		acceptanceCriteria?: string[];
+		verificationCommands?: string[];
+		greenlightRequired?: boolean;
+		reviewRequired?: boolean;
+		worktreeRequired?: boolean;
+		worktreePath?: string;
+	}): SwarmTaskRecord {
+		const run = loadSwarmRun(ctx, params.runId);
+		if (!run) throw new Error(`Swarm run not found: ${params.runId}`);
+		if (run.status !== "active") throw new Error(`Swarm run must be active to create tasks: ${run.id} is ${run.status}`);
+		const createdAt = nowIso();
+		const id = sanitize(params.id || `${run.id}-${params.lane || "task"}-${createdAt}`);
+		if (loadSwarmTask(ctx, id)) throw new Error(`Swarm task already exists: ${id}`);
+		const status = params.status || "ready";
+		if (!SWARM_TASK_STATUSES.has(status)) throw new Error(`Invalid task status: ${status}`);
+		const task: SwarmTaskRecord = {
+			schemaVersion: 1,
+			id,
+			runId: run.id,
+			lane: sanitize(params.lane || "general"),
+			title: params.title,
+			goal: params.goal || params.title,
+			status,
+			allowedPaths: params.allowedPaths || [],
+			ownedPaths: params.ownedPaths || [],
+			dependencies: params.dependencies || [],
+			unblocks: params.unblocks || [],
+			parentBlockedTask: params.parentBlockedTask,
+			acceptanceCriteria: params.acceptanceCriteria || [],
+			verificationCommands: params.verificationCommands || [],
+			greenlightRequired: Boolean(params.greenlightRequired),
+			reviewRequired: Boolean(params.reviewRequired),
+			worktreeRequired: Boolean(params.worktreeRequired),
+			worktreePath: params.worktreePath,
+			checkpoints: [],
+			createdAt,
+			updatedAt: createdAt,
+		};
+		saveSwarmTask(ctx, task);
+		return task;
+	}
+
+	function claimSwarmTask(ctx: ExtensionContext, taskId: string, agentId: string, leaseMinutes = 60): string {
+		return withSwarmTaskLock(ctx, taskId, () => {
+			const task = loadSwarmTask(ctx, taskId);
+			if (!task) throw new Error(`Swarm task not found: ${taskId}`);
+			if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) throw new Error("leaseMinutes must be positive");
+			const claimant = sanitize(agentId);
+			const blockers = swarmTaskClaimBlockers(ctx, task.runId, task, claimant);
+			if (blockers.length > 0) throw new Error(`Task is not claimable: ${task.id}\n- ${blockers.join("\n- ")}`);
+			task.status = "claimed";
+			task.claimOwner = claimant;
+			task.claimedAt = nowIso();
+			task.claimLeaseUntil = new Date(Date.now() + leaseMinutes * 60 * 1000).toISOString();
+			saveSwarmTask(ctx, task);
+			return `${task.id}: claimed by ${claimant} until ${task.claimLeaseUntil}`;
+		});
+	}
+
+	function checkpointSwarmTask(ctx: ExtensionContext, taskId: string, checkpoint: Omit<SwarmTaskCheckpoint, "createdAt"> & { status?: SwarmTaskStatus }): string {
+		const task = loadSwarmTask(ctx, taskId);
+		if (!task) throw new Error(`Swarm task not found: ${taskId}`);
+		const entry: SwarmTaskCheckpoint = { ...checkpoint, agentId: sanitize(checkpoint.agentId), createdAt: nowIso() };
+		if (entry.state === "DONE" && task.reviewRequired) {
+			if (task.status !== "review") throw new Error(`Task requires review before DONE: ${task.id} is ${task.status}`);
+			if (task.reviewRequestedBy && task.reviewRequestedBy === entry.agentId) throw new Error(`Review-required task cannot be closed by requester: ${entry.agentId}`);
+		}
+		if (entry.state === "DONE" && task.greenlightRequired && !entry.greenlit) throw new Error(`Task requires explicit greenlight before DONE: ${task.id}`);
+		task.checkpoints.push(entry);
+		if (entry.state === "DONE") task.status = "done";
+		else if (entry.state === "BLOCKED" || entry.state === "NEEDS_INPUT") task.status = "blocked";
+		else if (entry.state === "NEEDS_REVIEW") {
+			task.status = "review";
+			task.reviewRequestedBy = entry.agentId;
+			task.reviewRequestedAt = entry.createdAt;
+		}
+		else if (entry.state === "IN_PROGRESS") task.status = "running";
+		else if (entry.state === "HANDOFF") {
+			const status = checkpoint.status || "ready";
+			if (!SWARM_TASK_STATUSES.has(status)) throw new Error(`Invalid task status: ${status}`);
+			task.status = status;
+		}
+		if (["done", "blocked", "review", "ready"].includes(task.status)) {
+			delete task.claimOwner;
+			delete task.claimedAt;
+			delete task.claimLeaseUntil;
+		}
+		saveSwarmTask(ctx, task);
+		return `${task.id}: checkpoint ${entry.state} -> ${task.status}`;
 	}
 
 	function renderSwarmEscalations(records: SwarmEscalationRecord[]): string {
@@ -796,6 +1204,8 @@ export default function (pi: ExtensionAPI) {
 			markQueueRecord(ctx, record, "stale", `Agent is cancelled: ${agent.id}`);
 			return `${record.id}: stale (agent cancelled)`;
 		}
+		const dependencies = swarmDependencyReport(ctx, record.runId, syncSwarmAgentFromLoop(ctx, agent));
+		if (!dependencies.ready) return `${record.id}: blocked (waiting for ${dependencies.waiting.join(", ")})`;
 
 		const state = loadState(ctx, record.loopName);
 		if (!state) {
@@ -846,12 +1256,14 @@ export default function (pi: ExtensionAPI) {
 		mode: SwarmAgentMode,
 		allowedPaths: string[],
 		ownedPaths: string[],
+		setupNotes: string[] = [],
 	): string {
 		const scope = [
 			`Mode: ${mode}`,
 			`Allowed paths: ${allowedPaths.length > 0 ? allowedPaths.join(", ") : "not specified"}`,
 			`Owned paths: ${ownedPaths.length > 0 ? ownedPaths.join(", ") : "none"}`,
 		].join("\n");
+		const setup = setupNotes.length > 0 ? `\n## Setup Notes\n${setupNotes.map((note) => `- ${note}`).join("\n")}\n` : "";
 
 		return `# Swarm Agent: ${role}
 
@@ -867,6 +1279,7 @@ ${scope}
 
 ## Constraints
 ${run.constraints.length > 0 ? run.constraints.map((constraint) => `- ${constraint}`).join("\n") : "- Follow the top-level user instructions and repository safety rules."}
+${setup}
 
 ## Task
 ${taskContent}
@@ -1432,6 +1845,10 @@ Commands:
   /swarm resume [run]              Resume run metadata
   /swarm stop [run]                Mark run completed
   /swarm queue [run]               List queued/delivered prompt records
+  /swarm ready [run]               Show dependency-unblocked queued prompts
+  /swarm prune-queue [run]         Mark stale queued records as stale
+  /swarm tasks [run]               List swarm taskboard records
+  /swarm next-task [run]           Show claimable taskboard records
   /swarm drain [run]               Deliver one queued prompt into Pi/Ralph
   /swarm advise [run]              Show manager-side advisor recommendations
   /swarm escalations [run]         List open/resolved escalations
@@ -1527,6 +1944,39 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			if (runId && !run) return ctx.ui.notify("No swarm run found.", "warning");
 			const records = listSwarmQueueRecords(ctx, run ? { runId: run.id } : {});
 			ctx.ui.notify(renderSwarmQueue(records), records.length > 0 ? "info" : "warning");
+		},
+
+		ready(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			ctx.ui.notify(run ? renderSwarmReadyQueue(ctx, run) : "No swarm run found.", run ? "info" : "warning");
+		},
+
+		"prune-queue"(rest, ctx) {
+			const runId = rest.trim() || undefined;
+			const run = loadTargetSwarmRun(ctx, runId);
+			if (runId && !run) return ctx.ui.notify("No swarm run found.", "warning");
+			ctx.ui.notify(pruneStaleSwarmQueue(ctx, { runId: run?.id }), "info");
+		},
+
+		tasks(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			ctx.ui.notify(run ? renderSwarmTasks(listSwarmTasks(ctx, { runId: run.id })) : "No swarm run found.", run ? "info" : "warning");
+		},
+
+		"next-task"(rest, ctx) {
+			const parts = rest.trim().split(/\s+/).filter(Boolean);
+			const run = loadTargetSwarmRun(ctx, parts[0]);
+			ctx.ui.notify(run ? renderNextSwarmTasks(ctx, run.id, parts[1]) : "No swarm run found.", run ? "info" : "warning");
+		},
+
+		"claim-task"(rest, ctx) {
+			const [taskId, agentId] = rest.trim().split(/\s+/);
+			if (!taskId || !agentId) return ctx.ui.notify("Usage: /swarm claim-task <task> <agent>", "warning");
+			try {
+				ctx.ui.notify(claimSwarmTask(ctx, taskId, agentId), "info");
+			} catch (error) {
+				ctx.ui.notify((error as Error).message, "warning");
+			}
 		},
 
 		drain(rest, ctx) {
@@ -1729,6 +2179,7 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			allowedPaths: Type.Optional(Type.Array(Type.String())),
 			ownedPaths: Type.Optional(Type.Array(Type.String())),
 			dependencies: Type.Optional(Type.Array(Type.String())),
+			setupNotes: Type.Optional(Type.Array(Type.String())),
 			maxIterations: Type.Optional(Type.Number({ default: 20 })),
 			itemsPerIteration: Type.Optional(Type.Number({ default: 2 })),
 			reflectEvery: Type.Optional(Type.Number({ default: 5 })),
@@ -1745,18 +2196,26 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			const mode = (params.mode ?? "read-only") as SwarmAgentMode;
 			const allowedPaths = params.allowedPaths ?? [];
 			const ownedPaths = params.ownedPaths ?? [];
+			const dependencies = params.dependencies ?? [];
 			const existingAgents = listSwarmAgents(ctx, run.id);
+			const existingById = new Map<string, SwarmAgent>();
+			for (const existing of existingAgents.map((agent) => syncSwarmAgentFromLoop(ctx, agent))) {
+				existingById.set(sanitize(existing.id), existing);
+				existingById.set(sanitize(existing.loopName), existing);
+			}
+			const waitingDependencies = dependencies.filter((dependency) => existingById.get(sanitize(dependency))?.status !== "completed");
 			const index = existingAgents.length + 1;
 			const loopName = sanitize(`swarm-${run.id}-${params.role}-${index}`);
 			const agentId = loopName;
 			const taskFile = path.join(RALPH_DIR, `${loopName}.md`);
-			const taskContent = buildSwarmAgentTaskContent(run, params.role, params.taskContent, mode, allowedPaths, ownedPaths);
+			const setupNotes = params.setupNotes ?? [];
+			const taskContent = buildSwarmAgentTaskContent(run, params.role, params.taskContent, mode, allowedPaths, ownedPaths, setupNotes);
 			const fullPath = path.resolve(ctx.cwd, taskFile);
 			ensureDir(fullPath);
 			fs.writeFileSync(fullPath, taskContent, "utf-8");
 
 			const load = cognitiveLoad(ctx, run);
-			const autoQueue = (params.autoQueue ?? true) && load.level !== "critical";
+			const autoQueue = (params.autoQueue ?? true) && load.level !== "critical" && waitingDependencies.length === 0;
 			const loopState: LoopState = {
 				name: loopName,
 				taskFile,
@@ -1782,7 +2241,8 @@ Agents should use the swarm_* tools for structured orchestration.`;
 				status: autoQueue ? "active" : "paused",
 				allowedPaths,
 				ownedPaths,
-				dependencies: params.dependencies ?? [],
+				dependencies,
+				setupNotes,
 				maxIterations: loopState.maxIterations,
 				itemsPerIteration: loopState.itemsPerIteration,
 				reflectEvery: loopState.reflectEvery,
@@ -1802,7 +2262,11 @@ Agents should use the swarm_* tools for structured orchestration.`;
 				});
 			}
 			updateUI(ctx);
-			const queueNote = autoQueue ? "queued first iteration" : "created paused because autoQueue=false or load is critical";
+			const queueNote = autoQueue
+				? "queued first iteration"
+				: waitingDependencies.length > 0
+					? `created paused waiting for dependencies: ${waitingDependencies.join(", ")}`
+					: "created paused because autoQueue=false or load is critical";
 			return { content: [{ type: "text", text: `${agent.id}: ${queueNote}\n${renderSwarmBoard(ctx, run)}` }], details: { agentId: agent.id } };
 		},
 	});
@@ -1898,6 +2362,147 @@ Agents should use the swarm_* tools for structured orchestration.`;
 	});
 
 	pi.registerTool({
+		name: "swarm_next_ready",
+		label: "Next Ready Swarm Work",
+		description: "Show dependency-unblocked queued prompts and paused agents ready to enqueue.",
+		parameters: Type.Object({ runId: Type.Optional(Type.String()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadTargetSwarmRun(ctx, params.runId);
+			return { content: [{ type: "text", text: run ? renderSwarmReadyQueue(ctx, run) : "No swarm run found." }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_prune_queue",
+		label: "Prune Swarm Queue",
+		description: "Mark queued records stale when their agent or loop is already terminal or their prompt is no longer deliverable.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String()),
+			agentId: Type.Optional(Type.String()),
+			dryRun: Type.Optional(Type.Boolean({ default: false })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return {
+				content: [{ type: "text", text: pruneStaleSwarmQueue(ctx, { runId: params.runId, agentId: params.agentId }, params.dryRun ?? false) }],
+				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_create_task",
+		label: "Create Swarm Task",
+		description: "Create a first-class swarm taskboard record with dependencies, ownership, acceptance criteria, and verification commands.",
+		parameters: Type.Object({
+			runId: Type.String(),
+			id: Type.Optional(Type.String()),
+			title: Type.String(),
+			goal: Type.Optional(Type.String()),
+			lane: Type.Optional(Type.String()),
+			status: Type.Optional(Type.Union([Type.Literal("backlog"), Type.Literal("ready"), Type.Literal("claimed"), Type.Literal("running"), Type.Literal("review"), Type.Literal("blocked"), Type.Literal("done"), Type.Literal("stale")])),
+			allowedPaths: Type.Optional(Type.Array(Type.String())),
+			ownedPaths: Type.Optional(Type.Array(Type.String())),
+			dependencies: Type.Optional(Type.Array(Type.String())),
+			unblocks: Type.Optional(Type.Array(Type.String())),
+			parentBlockedTask: Type.Optional(Type.String()),
+			acceptanceCriteria: Type.Optional(Type.Array(Type.String())),
+			verificationCommands: Type.Optional(Type.Array(Type.String())),
+			greenlightRequired: Type.Optional(Type.Boolean({ default: false })),
+			reviewRequired: Type.Optional(Type.Boolean({ default: false })),
+			worktreeRequired: Type.Optional(Type.Boolean({ default: false })),
+			worktreePath: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			try {
+				const task = createSwarmTask(ctx, params as Parameters<typeof createSwarmTask>[1]);
+				return { content: [{ type: "text", text: renderSwarmTasks([task]) }], details: { taskId: task.id } };
+			} catch (error) {
+				return { content: [{ type: "text", text: (error as Error).message }], details: {} };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_list_tasks",
+		label: "List Swarm Tasks",
+		description: "List first-class swarm taskboard records.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String()),
+			status: Type.Optional(Type.Union([Type.Literal("backlog"), Type.Literal("ready"), Type.Literal("claimed"), Type.Literal("running"), Type.Literal("review"), Type.Literal("blocked"), Type.Literal("done"), Type.Literal("stale")])),
+			lane: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return { content: [{ type: "text", text: renderSwarmTasks(listSwarmTasks(ctx, params as { runId?: string; status?: SwarmTaskStatus; lane?: string })) }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_next_task",
+		label: "Next Claimable Swarm Task",
+		description: "Show dependency-unblocked taskboard records claimable by an optional agent.",
+		parameters: Type.Object({ runId: Type.String(), agentId: Type.Optional(Type.String()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return { content: [{ type: "text", text: renderNextSwarmTasks(ctx, params.runId, params.agentId) }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_claim_task",
+		label: "Claim Swarm Task",
+		description: "Atomically claim a dependency-ready swarm task with a lease.",
+		parameters: Type.Object({
+			taskId: Type.String(),
+			agentId: Type.String(),
+			leaseMinutes: Type.Optional(Type.Number({ default: 60 })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			try {
+				return { content: [{ type: "text", text: claimSwarmTask(ctx, params.taskId, params.agentId, params.leaseMinutes ?? 60) }], details: {} };
+			} catch (error) {
+				return { content: [{ type: "text", text: (error as Error).message }], details: {} };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_checkpoint_task",
+		label: "Checkpoint Swarm Task",
+		description: "Attach a proof-bearing checkpoint to a task and move it to running, review, blocked, ready, or done.",
+		parameters: Type.Object({
+			taskId: Type.String(),
+			state: Type.Union([Type.Literal("DONE"), Type.Literal("BLOCKED"), Type.Literal("NEEDS_INPUT"), Type.Literal("HANDOFF"), Type.Literal("IN_PROGRESS"), Type.Literal("NEEDS_REVIEW")]),
+			agentId: Type.String(),
+			filesChanged: Type.Optional(Type.Array(Type.String())),
+			commandsRun: Type.Optional(Type.Array(Type.String())),
+			result: Type.Optional(Type.String()),
+			blocker: Type.Optional(Type.String()),
+			nextAction: Type.Optional(Type.String()),
+			greenlit: Type.Optional(Type.Boolean({ default: false })),
+			status: Type.Optional(Type.Union([Type.Literal("backlog"), Type.Literal("ready"), Type.Literal("blocked"), Type.Literal("done"), Type.Literal("stale")])),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			try {
+				return {
+					content: [{ type: "text", text: checkpointSwarmTask(ctx, params.taskId, {
+						state: params.state as SwarmCheckpointState,
+						agentId: params.agentId,
+						filesChanged: params.filesChanged ?? [],
+						commandsRun: params.commandsRun ?? [],
+						result: params.result,
+						blocker: params.blocker,
+						nextAction: params.nextAction,
+						greenlit: params.greenlit,
+						status: params.status as SwarmTaskStatus | undefined,
+					}) }],
+					details: {},
+				};
+			} catch (error) {
+				return { content: [{ type: "text", text: (error as Error).message }], details: {} };
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "swarm_drain_queue",
 		label: "Drain Swarm Queue",
 		description: "Deliver queued swarm prompts into Pi/Ralph follow-up messages. Stops when Pi already has a pending message.",
@@ -1910,14 +2515,16 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			const records = listSwarmQueueRecords(ctx, { runId: params.runId, agentId: params.agentId, status: "queued" });
 			const limit = Math.max(1, params.limit ?? 1);
 			const results: string[] = [];
-			for (const record of records.slice(0, limit)) {
+			let delivered = 0;
+			for (const record of records) {
 				const result = deliverQueuedSwarmPrompt(ctx, record);
 				results.push(result);
-				if (result.includes("pending Pi messages") || result.includes("delivered")) break;
+				if (result.includes("delivered")) delivered += 1;
+				if (result.includes("pending Pi messages") || delivered >= limit) break;
 			}
 			return {
 				content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No queued swarm prompts." }],
-				details: { delivered: results.filter((result) => result.includes("delivered")).length, checked: results.length },
+				details: { delivered, checked: results.length },
 			};
 		},
 	});

@@ -14,6 +14,12 @@
 - Add manager-side swarm advice via `swarm_advise`, `/swarm advise`, and `pi-ralph-swarm advise` without introducing advisor agents.
 - Add explicit completed-loop continuation via `/ralph resume`, `swarm_continue_agent`, `pi-ralph-swarm continue-agent`, and `pi-ralph-swarm enqueue --continue-completed`.
 - Add `pi-ralph-swarm spawn-phase` to hydrate JSON roadmap phase contracts into normal swarm agents.
+- Add dependency-ready queue views via `/swarm ready`, `swarm_next_ready`, and `pi-ralph-swarm next-ready`.
+- Add phase-contract setup notes and verification environment notes copied into generated task files.
+- Add stale queue pruning via `/swarm prune-queue`, `swarm_prune_queue`, and `pi-ralph-swarm prune-queue`.
+- Add first-class swarm taskboard records with task creation, claim leases, claimability checks, and proof-bearing checkpoints via `swarm_create_task`, `swarm_list_tasks`, `swarm_next_task`, `swarm_claim_task`, `swarm_checkpoint_task`, and matching CLI commands.
+- Add Level 3 taskboard enforcement for implementation work: review-required tasks must pass through `NEEDS_REVIEW`, cannot be closed by the review requester, may require an existing isolated worktree before claim, and greenlight-required tasks need an explicit greenlit checkpoint before `DONE`.
+- Add `unblocks` and `parentBlockedTask` taskboard fields so unblock/design work can be traceable to a blocked parent without being blocked by `dependsOn` semantics.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
@@ -26,6 +32,9 @@
 - Extend `pi-ralph-swarm doctor` to flag and optionally relabel legacy terminal advisor-role metadata.
 - Clarify that swarm load is a manager/orchestrator cognitive-load guardrail, not a measure of subagent capacity.
 - Preserve queued agent status when a queued prompt belongs to a paused Ralph loop so swarm boards do not report queued phase agents as merely paused.
+- Make swarm queue draining dependency-aware so blocked phase prompts stay queued until prerequisites complete.
+- Count owned-path overlap only among non-terminal agents so completed historical writers do not keep closed boards at medium load.
+- Report completed swarm runs as closed in advice instead of recommending new work.
 
 ## 0.2.0 - 2026-04-19
 

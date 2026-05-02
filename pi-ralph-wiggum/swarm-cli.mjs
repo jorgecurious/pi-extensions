@@ -11,6 +11,8 @@ const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 const CLI_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PI_MODEL = "kimi-coding/kimi-for-coding";
 const SWARM_MODES = new Set(["read-only", "writer", "verifier", "integrator"]);
+const TASK_STATUSES = new Set(["backlog", "ready", "claimed", "running", "review", "blocked", "done", "stale"]);
+const CHECKPOINT_STATES = new Set(["DONE", "BLOCKED", "NEEDS_INPUT", "HANDOFF", "IN_PROGRESS", "NEEDS_REVIEW"]);
 const PHASE_AGENT_KINDS = new Map([
   ["scout", "read-only"],
   ["writer", "writer"],
@@ -77,6 +79,14 @@ function queueBase(cwd, agentId, queuedAt) {
   return path.join(cwd, SWARM_DIR, "queue", `${stamp}-${sanitize(agentId)}`);
 }
 
+function taskPath(cwd, taskId) {
+  return path.join(cwd, SWARM_DIR, "tasks", `${sanitize(taskId)}.json`);
+}
+
+function taskLockPath(cwd, taskId) {
+  return path.join(cwd, SWARM_DIR, "tasks", `${sanitize(taskId)}.lock`);
+}
+
 function escalationPath(cwd, escalationId) {
   return path.join(cwd, SWARM_DIR, "escalations", `${sanitize(escalationId)}.json`);
 }
@@ -122,6 +132,31 @@ function listQueueRecords(cwd, filters = {}) {
       return true;
     })
     .sort((a, b) => String(a.queuedAt || "").localeCompare(String(b.queuedAt || "")));
+}
+
+function loadTask(cwd, taskId) {
+  const filePath = taskPath(cwd, taskId);
+  if (!fs.existsSync(filePath)) throw new Error(`Swarm task not found: ${taskId}`);
+  return readJson(filePath);
+}
+
+function writeTask(cwd, task) {
+  task.id = sanitize(task.id);
+  task.updatedAt = nowIso();
+  writeJson(taskPath(cwd, task.id), task);
+}
+
+function listTasks(cwd, filters = {}) {
+  const dir = path.join(cwd, SWARM_DIR, "tasks");
+  return listFiles(dir, ".json")
+    .map((file) => readJson(path.join(dir, file)))
+    .filter((task) => {
+      if (filters.runId && task.runId !== sanitize(filters.runId)) return false;
+      if (filters.status && task.status !== filters.status) return false;
+      if (filters.lane && task.lane !== sanitize(filters.lane)) return false;
+      return true;
+    })
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")) || String(a.id).localeCompare(String(b.id)));
 }
 
 function listEscalationRecords(cwd, filters = {}) {
@@ -188,7 +223,7 @@ function cognitiveLoad(cwd, run) {
   const openEscalations = listEscalationRecords(cwd, { runId: run.id, status: "open" });
   const highEscalations = openEscalations.filter((record) => record.severity === "high").length;
   const owners = new Map();
-  for (const agent of agents) {
+  for (const agent of budgetAgents) {
     for (const ownerPath of agent.ownedPaths || []) {
       owners.set(ownerPath, [...(owners.get(ownerPath) || []), agent.id]);
     }
@@ -215,7 +250,7 @@ function cognitiveLoad(cwd, run) {
 
 function ownedPathOverlaps(agents) {
   const owners = new Map();
-  for (const agent of agents) {
+  for (const agent of agents.filter((candidate) => candidate.status !== "completed" && candidate.status !== "cancelled")) {
     for (const ownerPath of agent.ownedPaths || []) {
       owners.set(ownerPath, [...(owners.get(ownerPath) || []), agent.id]);
     }
@@ -223,8 +258,122 @@ function ownedPathOverlaps(agents) {
   return [...owners.entries()].filter(([, value]) => value.length > 1);
 }
 
+function pathsOverlap(a = [], b = []) {
+  return a.some((left) => b.some((right) => left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)));
+}
+
+function taskBlocksOwnedPath(task, now = Date.now()) {
+  if (task.status === "running" || task.status === "review") return true;
+  return task.status === "claimed" && (Date.parse(task.claimLeaseUntil || "") || 0) > now;
+}
+
+function taskDependencyReport(cwd, runId, task) {
+  const byId = new Map(listTasks(cwd, { runId }).map((candidate) => [sanitize(candidate.id), candidate]));
+  const waiting = [];
+  const satisfied = [];
+  for (const dependency of task.dependencies || []) {
+    const dependencyTask = byId.get(sanitize(dependency));
+    if (dependencyTask?.status === "done") satisfied.push(dependencyTask.id);
+    else waiting.push(`${dependency}${dependencyTask ? ` (${dependencyTask.status})` : " (missing)"}`);
+  }
+  return { ready: waiting.length === 0, waiting, satisfied };
+}
+
+function taskClaimBlockers(cwd, runId, task, claimantId) {
+  const blockers = [];
+  try {
+    const run = loadRun(cwd, runId);
+    if (run.status !== "active") blockers.push(`run is ${run.status}`);
+  } catch {
+    blockers.push(`run not found: ${runId}`);
+  }
+  const dependencyReport = taskDependencyReport(cwd, runId, task);
+  if (!dependencyReport.ready) blockers.push(`waiting for ${dependencyReport.waiting.join(", ")}`);
+  if (task.worktreeRequired) {
+    if (!task.worktreePath) blockers.push("isolated worktree is required but worktreePath is not set");
+    else if (!fs.existsSync(path.resolve(cwd, task.worktreePath))) blockers.push(`worktree path does not exist: ${task.worktreePath}`);
+  }
+  const now = Date.now();
+  const leaseUntil = Date.parse(task.claimLeaseUntil || "") || 0;
+  if (!["ready", "claimed"].includes(task.status)) blockers.push(`status is ${task.status}`);
+  if (task.status === "claimed" && leaseUntil > now && task.claimOwner !== claimantId) blockers.push(`claimed by ${task.claimOwner} until ${task.claimLeaseUntil}`);
+  const active = listTasks(cwd, { runId }).filter((candidate) => candidate.id !== task.id && taskBlocksOwnedPath(candidate, now));
+  for (const candidate of active) {
+    if (pathsOverlap(task.ownedPaths || [], candidate.ownedPaths || [])) blockers.push(`owned path overlap with ${candidate.id}`);
+  }
+  return blockers;
+}
+
+function claimableTasks(cwd, runId, claimantId) {
+  return listTasks(cwd, { runId }).filter((task) => taskClaimBlockers(cwd, runId, task, claimantId).length === 0);
+}
+
+function renderTasks(tasks) {
+  if (tasks.length === 0) return "No swarm tasks.";
+  return tasks
+    .map((task) => {
+      const owner = task.claimOwner ? ` owner=${task.claimOwner}` : "";
+      const lease = task.claimLeaseUntil ? ` lease=${task.claimLeaseUntil}` : "";
+      const lane = task.lane ? ` lane=${task.lane}` : "";
+      const review = task.reviewRequired ? " review-required" : "";
+      const worktree = task.worktreeRequired ? ` worktree=${task.worktreePath || "required"}` : "";
+      const parent = task.parentBlockedTask ? ` parent=${task.parentBlockedTask}` : "";
+      const unblocks = task.unblocks?.length ? ` unblocks=${task.unblocks.join(",")}` : "";
+      return `${task.id}: ${task.status}${lane}${owner}${lease}${review}${worktree}${parent}${unblocks} - ${task.title || task.goal || "(untitled)"}`;
+    })
+    .join("\n");
+}
+
+function renderNextTasks(cwd, runId, claimantId) {
+  const tasks = listTasks(cwd, { runId });
+  const ready = [];
+  const blocked = [];
+  for (const task of tasks) {
+    const blockers = taskClaimBlockers(cwd, runId, task, claimantId);
+    if (blockers.length === 0) ready.push(task);
+    else if (["ready", "claimed"].includes(task.status)) blocked.push(`${task.id}: ${blockers.join("; ")}`);
+  }
+  const lines = [`Claimable tasks for ${runId}${claimantId ? ` as ${claimantId}` : ""}:`];
+  if (ready.length === 0) lines.push("- none");
+  else for (const task of ready) lines.push(`- ${task.id}: ${task.title || task.goal || "(untitled)"}`);
+  if (blocked.length > 0) {
+    lines.push("Blocked ready tasks:");
+    for (const item of blocked) lines.push(`- ${item}`);
+  }
+  return lines.join("\n");
+}
+
+function withTaskLock(cwd, taskId, fn) {
+  const lockPath = taskLockPath(cwd, taskId);
+  ensureDir(lockPath);
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, "wx");
+    fs.writeFileSync(fd, `${process.pid}\n${nowIso()}\n`, "utf8");
+    return fn();
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error(`Task is locked by another claimant: ${taskId}`);
+    throw error;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try {
+      if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+    } catch {
+      // best effort lock cleanup
+    }
+  }
+}
+
 function advise(cwd, run) {
   const load = cognitiveLoad(cwd, run);
+  if (run.status === "completed") {
+    return {
+      urgency: "low",
+      summary: "completed run: no active roadmap work remains.",
+      recommendations: ["Start or resume a separate run only if new roadmap work is introduced."],
+      load,
+    };
+  }
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
   const activeAgents = agents.filter((agent) => agent.status === "active");
   const activeWriters = activeAgents.filter((agent) => agent.mode === "writer");
@@ -263,6 +412,7 @@ function renderBoard(cwd, run) {
   const load = cognitiveLoad(cwd, run);
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
   const queued = listQueueRecords(cwd, { runId: run.id, status: "queued" }).length;
+  const ready = readyQueueRecords(cwd, run.id).length;
   const openEscalations = listEscalationRecords(cwd, { runId: run.id, status: "open" }).length;
   const lines = [
     `Swarm: ${run.id} (${run.status})`,
@@ -271,6 +421,7 @@ function renderBoard(cwd, run) {
     `Budget: ${load.budgetAgents}/${run.maxAgents || 4} non-terminal agent(s), ${load.totalAgents} total`,
   ];
   if (queued > 0) lines.push(`Queue: ${queued} queued prompt(s)`);
+  if (ready > 0 && ready !== queued) lines.push(`Ready: ${ready} dependency-unblocked queued prompt(s)`);
   if (openEscalations > 0) lines.push(`Escalations: ${openEscalations} open`);
   lines.push(`Advice: ${advise(cwd, run).summary}`);
   if (run.constraints?.length) lines.push(`Constraints: ${run.constraints.join("; ")}`);
@@ -312,7 +463,8 @@ function has(args, flag) {
   return args.includes(flag);
 }
 
-function defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths) {
+function defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths, setupNotes = []) {
+  const setup = setupNotes.length ? `\n## Setup Notes\n${setupNotes.map((note) => `- ${note}`).join("\n")}\n` : "";
   return `# Swarm Agent: ${role}
 
 ## Run
@@ -329,6 +481,7 @@ Owned paths: ${ownedPaths.length ? ownedPaths.join(", ") : "none"}
 
 ## Task
 ${task}
+${setup}
 
 ## Checklist
 - [ ] Inspect relevant context before acting
@@ -401,6 +554,7 @@ function createSwarmAgent(cwd, run, options) {
   const taskFile = loopTaskPath(cwd, loopName);
   const allowedPaths = options.allowedPaths || [];
   const ownedPaths = options.ownedPaths || [];
+  const setupNotes = options.setupNotes || [];
   const task = options.task || "Complete the assigned swarm task.";
   const active = Boolean(options.active);
   if (options.failIfExists) {
@@ -409,7 +563,7 @@ function createSwarmAgent(cwd, run, options) {
   }
 
   ensureDir(taskFile);
-  fs.writeFileSync(taskFile, defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths), "utf8");
+  fs.writeFileSync(taskFile, defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths, setupNotes), "utf8");
 
   const state = {
     name: loopName,
@@ -437,6 +591,7 @@ function createSwarmAgent(cwd, run, options) {
     allowedPaths,
     ownedPaths,
     dependencies: options.dependencies || [],
+    setupNotes,
     maxIterations: state.maxIterations,
     itemsPerIteration: state.itemsPerIteration,
     reflectEvery: state.reflectEvery,
@@ -462,6 +617,7 @@ function commandSpawn(cwd, args) {
     mode: value(args, "--mode", "read-only"),
     allowedPaths: values(args, "--allowed"),
     ownedPaths: values(args, "--owned"),
+    setupNotes: values(args, "--setup-note"),
     task,
     active: !has(args, "--paused"),
     dependencies: values(args, "--depends-on"),
@@ -481,6 +637,12 @@ function optionalStringArray(value, label) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${label} must be an array of strings`);
   return value;
+}
+
+function optionalStringList(value, label) {
+  if (value === undefined) return [];
+  if (typeof value === "string") return [value];
+  return optionalStringArray(value, label);
 }
 
 function nonnegativeNumber(value, label, fallback) {
@@ -514,16 +676,90 @@ function phaseAgentLoopName(runId, phaseId, agentId) {
 }
 
 function phaseAgentTask(contract, phase, agent, task) {
+  const setupNotes = [
+    ...optionalStringList(contract.setupNotes, "contract.setupNotes"),
+    ...optionalStringList(phase.setupNotes, `${phase.id}.setupNotes`),
+    ...optionalStringList(agent.setupNotes, `${agent.id}.setupNotes`),
+  ];
+  const verificationEnvironment = [
+    ...optionalStringList(contract.verificationEnvironment, "contract.verificationEnvironment"),
+    ...optionalStringList(phase.verificationEnvironment, `${phase.id}.verificationEnvironment`),
+    ...optionalStringList(agent.verificationEnvironment, `${agent.id}.verificationEnvironment`),
+  ];
   return [
     `Roadmap contract: ${contract.name || "unnamed"}`,
     `Phase: ${phase.id}${phase.title ? ` - ${phase.title}` : ""}`,
     phase.goal ? `Phase goal: ${phase.goal}` : undefined,
     `Agent kind: ${agent.kind}`,
+    setupNotes.length ? `Setup notes:\n${setupNotes.map((note) => `- ${note}`).join("\n")}` : undefined,
+    verificationEnvironment.length ? `Verification environment:\n${verificationEnvironment.map((note) => `- ${note}`).join("\n")}` : undefined,
     "",
     task,
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function dependencyReport(cwd, agents, agent) {
+  const byId = new Map();
+  for (const candidate of agents) {
+    const synced = syncAgent(cwd, candidate);
+    byId.set(sanitize(synced.id), synced);
+    byId.set(sanitize(synced.loopName), synced);
+  }
+  const waiting = [];
+  const satisfied = [];
+  for (const dependency of agent.dependencies || []) {
+    const key = sanitize(dependency);
+    const dependencyAgent = byId.get(key);
+    if (dependencyAgent?.status === "completed") satisfied.push(dependencyAgent.id);
+    else waiting.push(`${dependency}${dependencyAgent ? ` (${dependencyAgent.status})` : " (missing)"}`);
+  }
+  return { ready: waiting.length === 0, waiting, satisfied };
+}
+
+function readyQueueRecords(cwd, runId) {
+  const agents = listAgents(cwd, runId).map((agent) => syncAgent(cwd, agent));
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  return listQueueRecords(cwd, { runId, status: "queued" }).filter((record) => {
+    const agent = byId.get(record.agentId);
+    return agent && ["queued", "paused"].includes(agent.status) ? dependencyReport(cwd, agents, agent).ready : false;
+  });
+}
+
+function renderReadyQueue(cwd, runId) {
+  const agents = listAgents(cwd, runId).map((agent) => syncAgent(cwd, agent));
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  const queued = listQueueRecords(cwd, { runId, status: "queued" });
+  const lines = [`Ready queue for ${runId}:`];
+  const ready = [];
+  const blocked = [];
+  for (const record of queued) {
+    const agent = byId.get(record.agentId);
+    if (!agent) {
+      blocked.push(`${record.agentId}: missing agent`);
+      continue;
+    }
+    if (!["queued", "paused"].includes(agent.status)) {
+      blocked.push(`${record.agentId}: not runnable (${agent.status})`);
+      continue;
+    }
+    const report = dependencyReport(cwd, agents, agent);
+    if (report.ready) ready.push(`${record.agentId}: ${record.id}`);
+    else blocked.push(`${record.agentId}: waiting for ${report.waiting.join(", ")}`);
+  }
+  if (ready.length === 0) lines.push("- none");
+  else for (const item of ready) lines.push(`- ${item}`);
+  if (blocked.length > 0) {
+    lines.push("Blocked queued prompts:");
+    for (const item of blocked) lines.push(`- ${item}`);
+  }
+  const pausedReady = agents.filter((agent) => agent.status === "paused" && dependencyReport(cwd, agents, agent).ready);
+  if (pausedReady.length > 0) {
+    lines.push("Paused agents ready to enqueue:");
+    for (const agent of pausedReady) lines.push(`- ${agent.id}`);
+  }
+  return lines.join("\n");
 }
 
 function planPhaseAgents(cwd, run, contractPath, contract, phaseId) {
@@ -733,6 +969,186 @@ function commandQueue(cwd, args) {
     .join("\n");
 }
 
+function staleQueueReason(cwd, record) {
+  if (record.status !== "queued") return undefined;
+  let agent;
+  try {
+    agent = syncAgent(cwd, loadAgent(cwd, record.agentId));
+  } catch {
+    return `Agent not found: ${record.agentId}`;
+  }
+  if (agent.status === "cancelled") return `Agent is cancelled: ${agent.id}`;
+  if (agent.status === "completed") return `Agent is completed: ${agent.id}`;
+  const stateFile = loopStatePath(cwd, record.loopName);
+  if (!fs.existsSync(stateFile)) return `Loop state not found: ${record.loopName}`;
+  const state = readJson(stateFile);
+  if (state.status === "completed") return `Loop is completed: ${record.loopName}`;
+  if ((state.queueGeneration ?? 0) !== record.queueGeneration) return `Queue generation mismatch: state=${state.queueGeneration ?? 0}, record=${record.queueGeneration}`;
+  if (!fs.existsSync(path.resolve(cwd, record.promptFile))) return `Prompt file not found: ${record.promptFile}`;
+  return undefined;
+}
+
+function commandPruneQueue(cwd, args) {
+  const records = listQueueRecords(cwd, {
+    runId: value(args, "--run"),
+    agentId: value(args, "--agent"),
+    status: "queued",
+  });
+  const stale = records
+    .map((record) => ({ record, reason: staleQueueReason(cwd, record) }))
+    .filter((item) => item.reason);
+  if (stale.length === 0) return "No stale queued swarm records found.";
+  const dryRun = has(args, "--dry-run");
+  const lines = [dryRun ? "Would mark stale queued records:" : "Marked stale queued records:"];
+  for (const { record, reason } of stale) {
+    if (!dryRun) {
+      record.status = "stale";
+      record.failureReason = reason;
+      writeJson(path.join(cwd, SWARM_DIR, "queue", `${sanitize(record.id)}.json`), record);
+    }
+    lines.push(`- ${record.id}: agent=${record.agentId}, reason=${reason}`);
+  }
+  return lines.join("\n");
+}
+
+function commandCreateTask(cwd, args) {
+  const run = loadRun(cwd, value(args, "--run"));
+  if (run.status !== "active") throw new Error(`swarm run must be active to create tasks: ${run.id} is ${run.status}`);
+  const title = value(args, "--title") || value(args, "--goal");
+  if (!title) throw new Error("task-create requires --title <text> or --goal <text>");
+  const createdAt = nowIso();
+  const id = sanitize(value(args, "--id") || `${run.id}-${value(args, "--lane", "task")}-${createdAt}`);
+  if (fs.existsSync(taskPath(cwd, id))) throw new Error(`swarm task already exists: ${id}`);
+  const status = value(args, "--status", "ready");
+  if (!TASK_STATUSES.has(status)) throw new Error(`invalid task status: ${status}`);
+  const task = {
+    schemaVersion: 1,
+    id,
+    runId: run.id,
+    lane: sanitize(value(args, "--lane", "general")),
+    title,
+    goal: value(args, "--goal", title),
+    status,
+    allowedPaths: values(args, "--allowed"),
+    ownedPaths: values(args, "--owned"),
+    dependencies: values(args, "--depends-on"),
+    unblocks: values(args, "--unblocks"),
+    parentBlockedTask: value(args, "--parent-blocked-task"),
+    acceptanceCriteria: values(args, "--acceptance"),
+    verificationCommands: values(args, "--verify"),
+    greenlightRequired: has(args, "--greenlight"),
+    reviewRequired: has(args, "--review-required") || has(args, "--implementation"),
+    worktreeRequired: has(args, "--worktree-required") || has(args, "--implementation"),
+    worktreePath: value(args, "--worktree"),
+    checkpoints: [],
+    createdAt,
+    updatedAt: createdAt,
+  };
+  writeTask(cwd, task);
+  return `${task.id}: ${task.status}\n${renderTasks([task])}`;
+}
+
+function commandTasks(cwd, args) {
+  const tasks = listTasks(cwd, {
+    runId: value(args, "--run"),
+    status: value(args, "--status"),
+    lane: value(args, "--lane"),
+  });
+  return renderTasks(tasks);
+}
+
+function commandNextTask(cwd, args) {
+  const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
+  if (!runId) return "No swarm runs found.";
+  loadRun(cwd, runId);
+  return renderNextTasks(cwd, sanitize(runId), value(args, "--agent"));
+}
+
+function commandClaimTask(cwd, args) {
+  const taskId = value(args, "--task");
+  const agentId = sanitize(value(args, "--agent"));
+  if (!taskId) throw new Error("claim-task requires --task <id>");
+  if (!agentId) throw new Error("claim-task requires --agent <id>");
+  return withTaskLock(cwd, taskId, () => {
+    const task = loadTask(cwd, taskId);
+    const blockers = taskClaimBlockers(cwd, task.runId, task, agentId);
+    if (blockers.length > 0) throw new Error(`Task is not claimable: ${task.id}\n- ${blockers.join("\n- ")}`);
+    const leaseMinutes = Number(value(args, "--lease-minutes", "60"));
+    if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) throw new Error("--lease-minutes must be positive");
+    task.status = "claimed";
+    task.claimOwner = agentId;
+    task.claimedAt = nowIso();
+    task.claimLeaseUntil = new Date(Date.now() + leaseMinutes * 60 * 1000).toISOString();
+    writeTask(cwd, task);
+    return `${task.id}: claimed by ${agentId} until ${task.claimLeaseUntil}`;
+  });
+}
+
+function commandReleaseTask(cwd, args) {
+  const taskId = value(args, "--task");
+  if (!taskId) throw new Error("release-task requires --task <id>");
+  const task = loadTask(cwd, taskId);
+  task.status = value(args, "--status", "ready");
+  if (!TASK_STATUSES.has(task.status)) throw new Error(`invalid task status: ${task.status}`);
+  delete task.claimOwner;
+  delete task.claimedAt;
+  delete task.claimLeaseUntil;
+  writeTask(cwd, task);
+  return `${task.id}: released to ${task.status}`;
+}
+
+function commandCheckpointTask(cwd, args) {
+  const taskId = value(args, "--task");
+  const state = value(args, "--state");
+  if (!taskId) throw new Error("checkpoint-task requires --task <id>");
+  if (!CHECKPOINT_STATES.has(state)) throw new Error("checkpoint-task requires --state DONE|BLOCKED|NEEDS_INPUT|HANDOFF|IN_PROGRESS|NEEDS_REVIEW");
+  const task = loadTask(cwd, taskId);
+  const agentId = sanitize(value(args, "--agent", task.claimOwner || "unknown"));
+  if (state === "DONE" && task.reviewRequired) {
+    if (task.status !== "review") throw new Error(`Task requires review before DONE: ${task.id} is ${task.status}`);
+    if (task.reviewRequestedBy && task.reviewRequestedBy === agentId) throw new Error(`Review-required task cannot be closed by requester: ${agentId}`);
+  }
+  if (state === "DONE" && task.greenlightRequired && !has(args, "--greenlit")) throw new Error(`Task requires explicit greenlight before DONE: ${task.id}`);
+  const checkpoint = {
+    state,
+    agentId,
+    filesChanged: values(args, "--file"),
+    commandsRun: values(args, "--command"),
+    result: value(args, "--result"),
+    blocker: value(args, "--blocker"),
+    nextAction: value(args, "--next-action"),
+    greenlit: has(args, "--greenlit"),
+    createdAt: nowIso(),
+  };
+  task.checkpoints = [...(task.checkpoints || []), checkpoint];
+  if (state === "DONE") task.status = "done";
+  else if (state === "BLOCKED" || state === "NEEDS_INPUT") task.status = "blocked";
+  else if (state === "NEEDS_REVIEW") {
+    task.status = "review";
+    task.reviewRequestedBy = checkpoint.agentId;
+    task.reviewRequestedAt = checkpoint.createdAt;
+  }
+  else if (state === "IN_PROGRESS") task.status = "running";
+  else if (state === "HANDOFF") {
+    task.status = value(args, "--status", "ready");
+    if (!TASK_STATUSES.has(task.status)) throw new Error(`invalid task status: ${task.status}`);
+  }
+  if (["done", "blocked", "review", "ready"].includes(task.status)) {
+    delete task.claimOwner;
+    delete task.claimedAt;
+    delete task.claimLeaseUntil;
+  }
+  writeTask(cwd, task);
+  return `${task.id}: checkpoint ${state} -> ${task.status}`;
+}
+
+function commandNextReady(cwd, args) {
+  const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
+  if (!runId) return "No swarm runs found.";
+  loadRun(cwd, runId);
+  return renderReadyQueue(cwd, sanitize(runId));
+}
+
 function commandAdvise(cwd, args) {
   const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
   if (!runId) return "No swarm runs found.";
@@ -858,6 +1274,11 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
         "ralph_done",
         "swarm_drain_queue",
         "swarm_list_queue",
+        "swarm_create_task",
+        "swarm_list_tasks",
+        "swarm_next_task",
+        "swarm_claim_task",
+        "swarm_checkpoint_task",
         "swarm_status",
         "swarm_advise",
         "swarm_collect",
@@ -1003,13 +1424,21 @@ function usage() {
 
 Commands:
   start --name ID --goal TEXT [--constraint TEXT] [--max-agents N]
-  spawn --run ID --role ROLE [--task TEXT_OR_FILE] [--mode read-only|writer|verifier|integrator] [--allowed PATH] [--owned PATH] [--paused]
+  spawn --run ID --role ROLE [--task TEXT_OR_FILE] [--mode read-only|writer|verifier|integrator] [--allowed PATH] [--owned PATH] [--setup-note TEXT] [--paused]
   spawn-phase --run ID --contract FILE --phase ID [--enqueue] [--activate] [--dry-run]
   status [--run ID]
   agents --run ID
   collect --agent ID
   enqueue --agent ID [--activate] [--continue-completed]
   queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
+  prune-queue [--run ID] [--agent ID] [--dry-run]
+  next-ready [--run ID]
+  task-create --run ID --title TEXT [--id ID] [--lane ID] [--owned PATH] [--depends-on TASK] [--unblocks TASK] [--parent-blocked-task TASK] [--acceptance TEXT] [--verify CMD] [--review-required] [--worktree-required] [--worktree PATH] [--greenlight]
+  tasks [--run ID] [--status STATUS] [--lane ID]
+  next-task [--run ID] [--agent ID]
+  claim-task --task ID --agent ID [--lease-minutes N]
+  release-task --task ID [--status ready|backlog|blocked|stale]
+  checkpoint-task --task ID --state STATE [--agent ID] [--file PATH] [--command CMD] [--result TEXT] [--blocker TEXT] [--next-action TEXT] [--greenlit]
   advise [--run ID]
   pi-queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed] [--model MODEL]
   delegate [--run ID] [--agent ID] [--limit N] [--model MODEL]
@@ -1044,6 +1473,14 @@ function main() {
   }
   if (command === "enqueue") return commandEnqueue(cwd, args);
   if (command === "queue") return commandQueue(cwd, args);
+  if (command === "prune-queue") return commandPruneQueue(cwd, args);
+  if (command === "next-ready") return commandNextReady(cwd, args);
+  if (command === "task-create") return commandCreateTask(cwd, args);
+  if (command === "tasks") return commandTasks(cwd, args);
+  if (command === "next-task") return commandNextTask(cwd, args);
+  if (command === "claim-task") return commandClaimTask(cwd, args);
+  if (command === "release-task") return commandReleaseTask(cwd, args);
+  if (command === "checkpoint-task") return commandCheckpointTask(cwd, args);
   if (command === "advise") return commandAdvise(cwd, args);
   if (command === "pi-queue") return commandPiQueue(cwd, args);
   if (command === "delegate") return commandDelegate(cwd, args);
