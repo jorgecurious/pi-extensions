@@ -89,7 +89,7 @@ Swarm mode stores top-level run and subagent metadata under `.ralph/swarm/` whil
 | Command | Description |
 |---------|-------------|
 | `/swarm start <name> <goal>` | Create a swarm run |
-| `/swarm status [run]` | Show the run board and cognitive-load score |
+| `/swarm status [run]` | Show the run board and orchestrator-load score |
 | `/swarm agents [run]` | List agents for a run |
 | `/swarm pause [run]` | Pause run metadata |
 | `/swarm resume [run]` | Resume run metadata |
@@ -143,9 +143,9 @@ Additional tools:
 - `swarm_list_escalations`: list open or resolved escalation records.
 - `swarm_resolve_escalation`: record the orchestrator decision for an escalation.
 
-### Cognitive load policy
+### Orchestrator load policy
 
-The swarm board scores load from active agents, active writer agents, blocked agents, unresolved blockers, open escalations, high-severity escalations, and overlapping owned paths. The max-agent budget counts non-terminal agents (`queued`, `active`, `paused`, `blocked`) and reports completed/cancelled agents separately as historical evidence, so long-running roadmap boards do not become noisy just because completed scouts accumulated.
+The swarm board scores manager/orchestrator load from active agents, active writer agents, blocked agents, unresolved blockers, open escalations, high-severity escalations, and overlapping owned paths. This is meant to protect the lead integrator's cognitive load, not to measure whether subagents can do more work. The max-agent budget counts non-terminal agents (`queued`, `active`, `paused`, `blocked`) and reports completed/cancelled agents separately as historical evidence, so long-running roadmap boards do not become noisy just because completed scouts accumulated.
 
 - Low: continue normally.
 - Medium: prefer one writer plus read-only verifier/scout agents.
@@ -166,6 +166,8 @@ For non-Pi agents or MCP-style evals, the package also ships a small dependency-
 ```bash
 pi-ralph-swarm start --name metal-pr-review --goal "Resolve PR review comments"
 pi-ralph-swarm spawn --run metal-pr-review --role verifier --mode verifier --task "Run focused tests"
+pi-ralph-swarm spawn-phase --run metal-pr-review --contract roadmap.json --phase review --dry-run
+pi-ralph-swarm spawn-phase --run metal-pr-review --contract roadmap.json --phase review --enqueue
 pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1 --continue-completed --activate
 pi-ralph-swarm queue --run metal-pr-review
@@ -182,6 +184,50 @@ pi-ralph-swarm doctor --run metal-pr-review --fix
 ```
 
 Use `pi-ralph-swarm ignore` in a worktree to add `.ralph/` to `.git/info/exclude`. This keeps local swarm state available to agents without risking accidental commits to upstreamable branches.
+
+### Roadmap contracts
+
+Use `pi-ralph-swarm spawn-phase` when a roadmap phase has a repeatable division of labor. The command reads a dependency-free JSON contract and hydrates the selected phase into ordinary swarm agents. It does not create a new scheduler or phase state; spawned agents are normal Ralph-backed swarm loops.
+
+Example contract:
+
+```json
+{
+  "schemaVersion": 1,
+  "name": "metal-roadmap",
+  "phases": [
+    {
+      "id": "gdn-artifacts",
+      "title": "GDN artifact hardening",
+      "goal": "Improve benchmark artifact reliability without changing kernels.",
+      "agents": [
+        {
+          "id": "schema-writer",
+          "kind": "writer",
+          "task": "Add JSON schema checks for raw GDN benchmark artifacts.",
+          "ownedPaths": ["benchmark/flashqla_metal/benchmark_gdn_raw_metal.py", "testing/python/metal/test_metal_gdn_benchmark.py"]
+        },
+        {
+          "id": "schema-verifier",
+          "kind": "verifier",
+          "task": "Verify the artifact schema checks and focused benchmark tests.",
+          "allowedPaths": ["benchmark/flashqla_metal", "testing/python/metal"],
+          "dependsOn": ["schema-writer"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Hydrate a phase into an existing active run:
+
+```bash
+pi-ralph-swarm spawn-phase --run metal-roadmap --contract roadmap.json --phase gdn-artifacts --dry-run
+pi-ralph-swarm spawn-phase --run metal-roadmap --contract roadmap.json --phase gdn-artifacts --enqueue
+```
+
+Agent kinds map to existing modes: `scout` -> `read-only`, `writer` -> `writer`, `debugger` -> `writer`, and `verifier` -> `verifier`. Explicit `mode` may still be one of `read-only`, `writer`, `verifier`, or `integrator`. Hydrated agents are paused by default; pass `--enqueue` to create queue records and `--activate` with `--enqueue` when you want Pi/Ralph to pick them up immediately.
 
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
 

@@ -13,6 +13,7 @@
 - Add durable swarm escalations via `swarm_escalate`, `swarm_list_escalations`, `swarm_resolve_escalation`, and matching `pi-ralph-swarm` CLI commands.
 - Add manager-side swarm advice via `swarm_advise`, `/swarm advise`, and `pi-ralph-swarm advise` without introducing advisor agents.
 - Add explicit completed-loop continuation via `/ralph resume`, `swarm_continue_agent`, `pi-ralph-swarm continue-agent`, and `pi-ralph-swarm enqueue --continue-completed`.
+- Add `pi-ralph-swarm spawn-phase` to hydrate JSON roadmap phase contracts into normal swarm agents.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
@@ -23,6 +24,8 @@
 - Count only non-terminal agents against the swarm max-agent budget so completed/cancelled historical agents do not create noisy budget warnings.
 - Centralize advisor-role reservation so terminal `advisor` roles are rejected while scoped roles such as `advisor-scout` remain valid.
 - Extend `pi-ralph-swarm doctor` to flag and optionally relabel legacy terminal advisor-role metadata.
+- Clarify that swarm load is a manager/orchestrator cognitive-load guardrail, not a measure of subagent capacity.
+- Preserve queued agent status when a queued prompt belongs to a paused Ralph loop so swarm boards do not report queued phase agents as merely paused.
 
 ## 0.2.0 - 2026-04-19
 

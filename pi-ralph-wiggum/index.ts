@@ -539,7 +539,7 @@ export default function (pi: ExtensionAPI) {
 		const loop = loadState(ctx, agent.loopName);
 		if (!loop) return agent;
 		if (loop.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
-		else if (loop.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "paused";
+		else if (loop.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "paused";
 		else if (loop.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
 		saveSwarmAgent(ctx, agent);
 		return agent;

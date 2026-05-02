@@ -10,6 +10,13 @@ const SWARM_DIR = path.join(RALPH_DIR, "swarm");
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 const CLI_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PI_MODEL = "kimi-coding/kimi-for-coding";
+const SWARM_MODES = new Set(["read-only", "writer", "verifier", "integrator"]);
+const PHASE_AGENT_KINDS = new Map([
+  ["scout", "read-only"],
+  ["writer", "writer"],
+  ["debugger", "writer"],
+  ["verifier", "verifier"],
+]);
 
 const COMPLETION_GATE = `COMPLETION GATE
 
@@ -145,7 +152,7 @@ function syncAgent(cwd, agent) {
   if (!fs.existsSync(stateFile)) return agent;
   const state = readJson(stateFile);
   if (state.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
-  else if (state.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled") agent.status = "paused";
+  else if (state.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "paused";
   else if (state.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
   agent.updatedAt = nowIso();
   writeJson(agentPath(cwd, agent.id), agent);
@@ -382,22 +389,24 @@ function commandStart(cwd, args) {
   return renderBoard(cwd, run);
 }
 
-function commandSpawn(cwd, args) {
-  const run = loadRun(cwd, value(args, "--run"));
-  const role = value(args, "--role");
+function createSwarmAgent(cwd, run, options) {
+  const role = options.role;
   if (!role) throw new Error("spawn requires --role <role>");
   if (isAdvisorAgentRole(role)) {
     throw new Error("Advisor is manager-side behavior, not a swarm agent role. Use advise instead.");
   }
-  const agents = listAgents(cwd, run.id);
-  const loopName = sanitize(value(args, "--loop", `swarm-${run.id}-${role}-${agents.length + 1}`));
+  const mode = options.mode || "read-only";
+  if (!SWARM_MODES.has(mode)) throw new Error(`invalid agent mode: ${mode}`);
+  const loopName = sanitize(options.loopName);
   const taskFile = loopTaskPath(cwd, loopName);
-  const mode = value(args, "--mode", "read-only");
-  const allowedPaths = values(args, "--allowed");
-  const ownedPaths = values(args, "--owned");
-  const taskArg = value(args, "--task", "Complete the assigned swarm task.");
-  const task = fs.existsSync(taskArg) ? fs.readFileSync(taskArg, "utf8") : taskArg;
-  const active = !has(args, "--paused");
+  const allowedPaths = options.allowedPaths || [];
+  const ownedPaths = options.ownedPaths || [];
+  const task = options.task || "Complete the assigned swarm task.";
+  const active = Boolean(options.active);
+  if (options.failIfExists) {
+    const collisions = [taskFile, loopStatePath(cwd, loopName), agentPath(cwd, loopName)].filter((filePath) => fs.existsSync(filePath));
+    if (collisions.length) throw new Error(`swarm agent already exists for ${loopName}: ${collisions.map((filePath) => path.relative(cwd, filePath)).join(", ")}`);
+  }
 
   ensureDir(taskFile);
   fs.writeFileSync(taskFile, defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths), "utf8");
@@ -406,9 +415,9 @@ function commandSpawn(cwd, args) {
     name: loopName,
     taskFile: path.relative(cwd, taskFile),
     iteration: 1,
-    maxIterations: Number(value(args, "--max-iterations", "20")),
-    itemsPerIteration: Number(value(args, "--items-per-iteration", "2")),
-    reflectEvery: Number(value(args, "--reflect-every", "5")),
+    maxIterations: Number(options.maxIterations ?? 20),
+    itemsPerIteration: Number(options.itemsPerIteration ?? 2),
+    reflectEvery: Number(options.reflectEvery ?? 5),
     reflectInstructions: "Pause and reflect on progress, blockers, and whether the approach should change.",
     active,
     status: active ? "active" : "paused",
@@ -427,7 +436,7 @@ function commandSpawn(cwd, args) {
     status: state.status,
     allowedPaths,
     ownedPaths,
-    dependencies: values(args, "--depends-on"),
+    dependencies: options.dependencies || [],
     maxIterations: state.maxIterations,
     itemsPerIteration: state.itemsPerIteration,
     reflectEvery: state.reflectEvery,
@@ -438,7 +447,171 @@ function commandSpawn(cwd, args) {
   if (!run.agentIds.includes(agent.id)) run.agentIds.push(agent.id);
   run.updatedAt = nowIso();
   writeJson(runPath(cwd, run.id), run);
+  return agent;
+}
+
+function commandSpawn(cwd, args) {
+  const run = loadRun(cwd, value(args, "--run"));
+  const role = value(args, "--role");
+  const agents = listAgents(cwd, run.id);
+  const taskArg = value(args, "--task", "Complete the assigned swarm task.");
+  const task = fs.existsSync(taskArg) ? fs.readFileSync(taskArg, "utf8") : taskArg;
+  const agent = createSwarmAgent(cwd, run, {
+    role,
+    loopName: value(args, "--loop", `swarm-${run.id}-${role}-${agents.length + 1}`),
+    mode: value(args, "--mode", "read-only"),
+    allowedPaths: values(args, "--allowed"),
+    ownedPaths: values(args, "--owned"),
+    task,
+    active: !has(args, "--paused"),
+    dependencies: values(args, "--depends-on"),
+    maxIterations: Number(value(args, "--max-iterations", "20")),
+    itemsPerIteration: Number(value(args, "--items-per-iteration", "2")),
+    reflectEvery: Number(value(args, "--reflect-every", "5")),
+  });
   return `${agent.id}: ${agent.status}\n${renderBoard(cwd, run)}`;
+}
+
+function requireArray(value, label) {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value;
+}
+
+function optionalStringArray(value, label) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${label} must be an array of strings`);
+  return value;
+}
+
+function nonnegativeNumber(value, label, fallback) {
+  const number = value === undefined ? fallback : Number(value);
+  if (!Number.isFinite(number) || number < 0) throw new Error(`${label} must be a non-negative number`);
+  return number;
+}
+
+function loadPhaseContract(contractPath) {
+  let contract;
+  try {
+    contract = readJson(contractPath);
+  } catch (error) {
+    throw new Error(`Unable to read roadmap contract ${contractPath}: ${error.message}`);
+  }
+  if (contract.schemaVersion !== 1) throw new Error("roadmap contract schemaVersion must be 1");
+  const phases = requireArray(contract.phases, "roadmap contract phases");
+  if (phases.length === 0) throw new Error("roadmap contract must contain at least one phase");
+  const phaseIds = new Set();
+  for (const phase of phases) {
+    const id = sanitize(phase.id);
+    if (!id) throw new Error("roadmap contract phase id is required");
+    if (phaseIds.has(id)) throw new Error(`duplicate roadmap phase id after sanitize: ${id}`);
+    phaseIds.add(id);
+  }
+  return contract;
+}
+
+function phaseAgentLoopName(runId, phaseId, agentId) {
+  return sanitize(`swarm-${runId}-${phaseId}-${agentId}`);
+}
+
+function phaseAgentTask(contract, phase, agent, task) {
+  return [
+    `Roadmap contract: ${contract.name || "unnamed"}`,
+    `Phase: ${phase.id}${phase.title ? ` - ${phase.title}` : ""}`,
+    phase.goal ? `Phase goal: ${phase.goal}` : undefined,
+    `Agent kind: ${agent.kind}`,
+    "",
+    task,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function planPhaseAgents(cwd, run, contractPath, contract, phaseId) {
+  if (run.status !== "active") throw new Error(`swarm run must be active to hydrate a phase: ${run.id} is ${run.status}`);
+  const contractDir = path.dirname(contractPath);
+  const phase = contract.phases.find((candidate) => sanitize(candidate.id) === sanitize(phaseId));
+  if (!phase) throw new Error(`roadmap phase not found: ${phaseId}`);
+  const agents = requireArray(phase.agents, `phase ${phase.id} agents`);
+  if (agents.length === 0) throw new Error(`roadmap phase has no agents: ${phase.id}`);
+  const phaseSanitized = sanitize(phase.id);
+  const agentIds = new Set();
+  const planned = [];
+  for (const agent of agents) {
+    const agentId = sanitize(agent.id);
+    if (!agentId) throw new Error(`phase ${phase.id} agent id is required`);
+    if (agentIds.has(agentId)) throw new Error(`duplicate phase agent id after sanitize: ${agentId}`);
+    agentIds.add(agentId);
+  }
+  for (const agent of agents) {
+    const agentId = sanitize(agent.id);
+    const kind = String(agent.kind || "");
+    if (!PHASE_AGENT_KINDS.has(kind)) throw new Error(`invalid phase agent kind for ${agentId}: ${kind}`);
+    const mode = agent.mode || PHASE_AGENT_KINDS.get(kind);
+    if (!SWARM_MODES.has(mode)) throw new Error(`invalid phase agent mode for ${agentId}: ${mode}`);
+    const role = agent.role || `${phaseSanitized}-${agentId}`;
+    if (isAdvisorAgentRole(role)) throw new Error(`phase agent role is reserved for manager-side advice: ${role}`);
+    const allowedPaths = optionalStringArray(agent.allowedPaths, `${agentId}.allowedPaths`);
+    const ownedPaths = optionalStringArray(agent.ownedPaths, `${agentId}.ownedPaths`);
+    const dependsOn = optionalStringArray(agent.dependsOn, `${agentId}.dependsOn`);
+    for (const dependency of dependsOn) {
+      if (!agentIds.has(sanitize(dependency))) throw new Error(`phase agent ${agentId} depends on unknown agent: ${dependency}`);
+    }
+    let task = agent.task;
+    if (agent.taskFile) {
+      if (task) throw new Error(`phase agent ${agentId} must use only one of task or taskFile`);
+      const taskPath = path.resolve(contractDir, agent.taskFile);
+      if (!fs.existsSync(taskPath)) throw new Error(`phase agent taskFile not found: ${agent.taskFile}`);
+      task = fs.readFileSync(taskPath, "utf8");
+    }
+    if (!task || typeof task !== "string") throw new Error(`phase agent ${agentId} requires task or taskFile`);
+    const loopName = phaseAgentLoopName(run.id, phaseSanitized, agentId);
+    planned.push({
+      id: agentId,
+      role,
+      kind,
+      mode,
+      loopName,
+      allowedPaths,
+      ownedPaths,
+      task: phaseAgentTask(contract, phase, agent, task),
+      dependencies: dependsOn.map((dependency) => phaseAgentLoopName(run.id, phaseSanitized, sanitize(dependency))),
+      maxIterations: nonnegativeNumber(agent.maxIterations, `${agentId}.maxIterations`, 20),
+      itemsPerIteration: nonnegativeNumber(agent.itemsPerIteration, `${agentId}.itemsPerIteration`, 2),
+      reflectEvery: nonnegativeNumber(agent.reflectEvery, `${agentId}.reflectEvery`, 5),
+    });
+  }
+  const loopIds = new Set();
+  for (const plan of planned) {
+    if (loopIds.has(plan.loopName)) throw new Error(`duplicate planned loop id: ${plan.loopName}`);
+    loopIds.add(plan.loopName);
+    const collisions = [loopTaskPath(cwd, plan.loopName), loopStatePath(cwd, plan.loopName), agentPath(cwd, plan.loopName)].filter((filePath) => fs.existsSync(filePath));
+    if (collisions.length) throw new Error(`planned phase agent already exists for ${plan.loopName}: ${collisions.map((filePath) => path.relative(cwd, filePath)).join(", ")}`);
+  }
+  return { phase, planned };
+}
+
+function commandSpawnPhase(cwd, args) {
+  const run = loadRun(cwd, value(args, "--run"));
+  const contractPath = path.resolve(cwd, value(args, "--contract") || "");
+  if (!value(args, "--contract")) throw new Error("spawn-phase requires --contract <file>");
+  const phaseId = value(args, "--phase");
+  if (!phaseId) throw new Error("spawn-phase requires --phase <id>");
+  const contract = loadPhaseContract(contractPath);
+  const { phase, planned } = planPhaseAgents(cwd, run, contractPath, contract, phaseId);
+  const lines = [`Phase ${phase.id}: ${phase.title || "(untitled)"}`, `Planned agents: ${planned.length}`];
+  for (const plan of planned) lines.push(`- ${plan.loopName}: ${plan.kind}/${plan.mode}, role=${plan.role}`);
+  if (has(args, "--dry-run")) return lines.join("\n");
+  const spawned = [];
+  for (const plan of planned) {
+    const agent = createSwarmAgent(cwd, run, {
+      ...plan,
+      active: false,
+      failIfExists: true,
+    });
+    spawned.push(agent);
+    if (has(args, "--enqueue")) commandEnqueue(cwd, ["--agent", agent.id, ...(has(args, "--activate") ? ["--activate"] : [])]);
+  }
+  return [...lines, `Spawned agents: ${spawned.map((agent) => agent.id).join(", ")}`, renderBoard(cwd, loadRun(cwd, run.id))].join("\n");
 }
 
 function commandRecord(cwd, args, kind) {
@@ -831,6 +1004,7 @@ function usage() {
 Commands:
   start --name ID --goal TEXT [--constraint TEXT] [--max-agents N]
   spawn --run ID --role ROLE [--task TEXT_OR_FILE] [--mode read-only|writer|verifier|integrator] [--allowed PATH] [--owned PATH] [--paused]
+  spawn-phase --run ID --contract FILE --phase ID [--enqueue] [--activate] [--dry-run]
   status [--run ID]
   agents --run ID
   collect --agent ID
@@ -858,6 +1032,7 @@ function main() {
   if (!command || command === "help" || command === "--help") return usage();
   if (command === "start") return commandStart(cwd, args);
   if (command === "spawn") return commandSpawn(cwd, args);
+  if (command === "spawn-phase") return commandSpawnPhase(cwd, args);
   if (command === "status") {
     const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
     return runId ? renderBoard(cwd, loadRun(cwd, runId)) : "No swarm runs found.";
