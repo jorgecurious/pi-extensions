@@ -27,6 +27,7 @@ const FINAL_VERIFICATION_FIELDS = [
   "Result",
 ];
 const FINAL_VERIFICATION_PLACEHOLDERS = new Set(["", "<command>", "<path>", "<paths>", "<output summary>"]);
+const NO_ARTIFACT_VALUES = new Set(["none", "n/a", "na", "not needed", "not applicable"]);
 
 const COMPLETION_GATE = `COMPLETION GATE
 
@@ -36,7 +37,8 @@ Before completion:
 2. Record the exact command, working directory, relevant environment variables, and output summary in the task file.
 3. Preserve every artifact required by that command, including build directories, generated libraries, virtualenvs, caches, or copied dylibs.
 4. If cleanup removes required artifacts, recreate them or update the final command before completing.
-5. If the final command cannot be made externally rerunnable, mark the item blocked/deferred instead of complete.`;
+5. Call swarm_verify_agent after updating Final Verification, then complete only if the monitor pass succeeds for the current task file.
+6. If the final command cannot be made externally rerunnable, mark the item blocked/deferred instead of complete.`;
 
 const STALE_PROMPT_GUARD = `STALE PROMPT GUARD
 
@@ -88,13 +90,40 @@ function finalVerificationValue(content, label) {
   return match ? match[1].trim() : undefined;
 }
 
+function cleanFinalVerificationValue(value) {
+  return String(value || "").trim().replace(/^`|`$/g, "").replace(/^['"]|['"]$/g, "").trim();
+}
+
+function finalVerificationFields(content) {
+  const fields = {};
+  for (const label of FINAL_VERIFICATION_FIELDS) fields[label] = cleanFinalVerificationValue(finalVerificationValue(content, label));
+  return fields;
+}
+
+function parseArtifactPaths(value) {
+  const cleaned = cleanFinalVerificationValue(value);
+  if (NO_ARTIFACT_VALUES.has(cleaned.toLowerCase())) return [];
+  return cleaned
+    .split(",")
+    .map((item) => cleanFinalVerificationValue(item.trim()))
+    .filter((item) => item.length > 0 && !NO_ARTIFACT_VALUES.has(item.toLowerCase()));
+}
+
+function artifactStatuses(workingDirectory, artifactField) {
+  return parseArtifactPaths(artifactField).map((artifactPath) => {
+    const resolved = path.isAbsolute(artifactPath) ? artifactPath : path.resolve(workingDirectory, artifactPath);
+    return { path: artifactPath, exists: fs.existsSync(resolved) };
+  });
+}
+
 function validateFinalVerification(content) {
   const reasons = [];
   for (const label of FINAL_VERIFICATION_FIELDS) {
     const value = finalVerificationValue(content, label);
+    const cleaned = cleanFinalVerificationValue(value);
     if (value === undefined) {
       reasons.push(`missing Final Verification field: ${label}`);
-    } else if (FINAL_VERIFICATION_PLACEHOLDERS.has(value.toLowerCase())) {
+    } else if (FINAL_VERIFICATION_PLACEHOLDERS.has(cleaned.toLowerCase())) {
       reasons.push(`placeholder Final Verification field: ${label}`);
     }
   }
@@ -109,9 +138,63 @@ function validateAgentCompletion(cwd, agent) {
   const content = fs.readFileSync(taskFile, "utf8");
   const hash = sha256(content);
   const reasons = validateFinalVerification(content);
+  const fields = finalVerificationFields(content);
+  const workingDirectory = fields["Working directory"];
+  if (workingDirectory && !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory}`);
+  const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
+  for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
+  const monitor = agent.completionEvidence?.monitor;
+  if (!monitor) reasons.push("missing monitor verification: run verify-agent first");
+  else {
+    if (!monitor.ok || monitor.exitCode !== 0) reasons.push(`monitor verification failed: exit=${monitor.exitCode}`);
+    if (monitor.taskFileHash !== hash) reasons.push("monitor verification is stale for current task file");
+    if (monitor.command !== fields["Exact monitor-rerunnable command"]) reasons.push("monitor verification command differs from current Final Verification command");
+    if (monitor.workingDirectory !== workingDirectory) reasons.push("monitor verification working directory differs from current Final Verification working directory");
+    for (const artifact of monitor.artifacts || []) if (!artifact.exists) reasons.push(`monitor artifact missing: ${artifact.path}`);
+  }
   const initialHash = agent.completionEvidence?.initialTaskFileHash;
   if (initialHash && hash === initialHash) reasons.push("task file unchanged since agent creation");
   return { ok: reasons.length === 0, reasons, hash, size: Buffer.byteLength(content, "utf8") };
+}
+
+function tailOutput(value) {
+  if (!value) return undefined;
+  return value.length > 4000 ? value.slice(value.length - 4000) : value;
+}
+
+function verifyAgent(cwd, agent, timeoutMs = 120000) {
+  const taskFile = path.resolve(cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
+  if (!fs.existsSync(taskFile)) return `Verification failed for ${agent.id}: task file not found: ${path.relative(cwd, taskFile)}`;
+  const content = fs.readFileSync(taskFile, "utf8");
+  const hash = sha256(content);
+  const reasons = validateFinalVerification(content);
+  const fields = finalVerificationFields(content);
+  const command = fields["Exact monitor-rerunnable command"];
+  const workingDirectory = fields["Working directory"];
+  if (!workingDirectory || !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory || "(missing)"}`);
+  const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
+  for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
+
+  let exitCode = null;
+  let stdoutTail;
+  let stderrTail;
+  let errorText;
+  if (reasons.length === 0) {
+    const result = spawnSync(command, { cwd: workingDirectory, shell: true, encoding: "utf8", timeout: timeoutMs });
+    exitCode = result.status;
+    stdoutTail = tailOutput(result.stdout);
+    stderrTail = tailOutput(result.stderr);
+    if (result.error) errorText = result.error.message;
+    if (result.error) reasons.push(`monitor command error: ${result.error.message}`);
+    if (result.status !== 0) reasons.push(`monitor command failed: exit=${result.status}`);
+  }
+  const ok = reasons.length === 0;
+  agent.completionEvidence = {
+    ...(agent.completionEvidence || {}),
+    monitor: { verifiedAt: nowIso(), taskFileHash: hash, command, workingDirectory, exitCode, ok, stdoutTail, stderrTail, error: errorText, artifacts },
+  };
+  writeJson(agentPath(cwd, agent.id), agent);
+  return ok ? `Verified ${agent.id}: ${command}` : `Verification failed for ${agent.id}: ${reasons.join("; ")}`;
 }
 
 function recordCompletionCheck(agent, validation) {
@@ -570,6 +653,7 @@ ${setup}
 
 ## Verification
 - Commands run, working directories, relevant environment variables, outputs, and preserved artifacts
+- Before completion, call swarm_verify_agent or run pi-ralph-swarm verify-agent after Final Verification is updated
 
 ## Final Verification
 - Exact monitor-rerunnable command: <command>
@@ -597,6 +681,7 @@ function buildRalphPrompt(state, taskContent, isReflection) {
   } else {
     parts.push(`Continue the task, update ${state.taskFile}, then call ralph_done unless the completion gate is satisfied.`);
   }
+  parts.push("For swarm agents, run swarm_verify_agent or pi-ralph-swarm verify-agent after updating Final Verification and before completing.");
   parts.push(`When fully complete and the completion gate is satisfied, respond with: ${COMPLETE_MARKER}`);
   return `${parts.join("\n")}\n`;
 }
@@ -936,13 +1021,26 @@ function commandRecord(cwd, args, kind) {
   const text = value(args, "--text");
   if (!text) throw new Error(`${kind} requires --text <text>`);
   if (kind === "decision") {
-    run.decisions.push({ text, rationale: value(args, "--rationale"), createdAt: nowIso() });
+    run.decisions.push({
+      text,
+      rationale: value(args, "--rationale"),
+      source: value(args, "--source"),
+      agentId: value(args, "--agent"),
+      taskId: value(args, "--task"),
+      queueId: value(args, "--queue"),
+      createdAt: nowIso(),
+    });
   } else {
     run.blockers.push({ text, neededDecision: value(args, "--needed-decision"), createdAt: nowIso() });
   }
   run.updatedAt = nowIso();
   writeJson(runPath(cwd, run.id), run);
   return `${kind} recorded for ${run.id}: ${text}`;
+}
+
+function commandVerifyAgent(cwd, args) {
+  const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
+  return verifyAgent(cwd, agent, Number(value(args, "--timeout-ms", "120000")) || 120000);
 }
 
 function commandAgentStatus(cwd, args, status) {
@@ -1031,6 +1129,7 @@ function commandEnqueue(cwd, args) {
     promptFile: path.relative(cwd, promptPath),
     stateFile: path.relative(cwd, stateFile),
     taskFile: path.relative(cwd, taskPath),
+    deliveryAttempts: [],
     note: "Queue record only. Pi/Ralph must deliver this prompt; pi-ralph-swarm did not execute the agent.",
   });
   state.queuedAt = queuedAt;
@@ -1045,6 +1144,21 @@ function commandEnqueue(cwd, args) {
   return `${agent.id}: queued for Pi/Ralph follow-up\nrecord: ${path.relative(cwd, recordPath)}\nprompt: ${path.relative(cwd, promptPath)}`;
 }
 
+function queuePromptHash(cwd, record) {
+  const promptPath = path.resolve(cwd, record.promptFile || "");
+  return fs.existsSync(promptPath) ? sha256(fs.readFileSync(promptPath, "utf8")) : undefined;
+}
+
+function appendQueueAttempt(cwd, record, status, reason) {
+  record.deliveryAttempts = [...(record.deliveryAttempts || []), {
+    at: nowIso(),
+    status,
+    reason,
+    queueGeneration: record.queueGeneration ?? 0,
+    promptHash: queuePromptHash(cwd, record),
+  }];
+}
+
 function commandQueue(cwd, args) {
   const records = listQueueRecords(cwd, {
     runId: value(args, "--run"),
@@ -1056,7 +1170,8 @@ function commandQueue(cwd, args) {
     .map((record) => {
       const delivered = record.deliveredAt ? ` delivered=${record.deliveredAt}` : "";
       const failure = record.failureReason ? ` failure=${record.failureReason}` : "";
-      return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration ?? 0}, queued=${record.queuedAt}${delivered}${failure}`;
+      const attempts = record.deliveryAttempts?.length ? ` attempts=${record.deliveryAttempts.length}` : "";
+      return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration ?? 0}, queued=${record.queuedAt}${delivered}${failure}${attempts}`;
     })
     .join("\n");
 }
@@ -1096,6 +1211,7 @@ function commandPruneQueue(cwd, args) {
     if (!dryRun) {
       record.status = "stale";
       record.failureReason = reason;
+      appendQueueAttempt(cwd, record, "stale", reason);
       writeJson(path.join(cwd, SWARM_DIR, "queue", `${sanitize(record.id)}.json`), record);
     }
     lines.push(`- ${record.id}: agent=${record.agentId}, reason=${reason}`);
@@ -1374,6 +1490,7 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
         "swarm_status",
         "swarm_advise",
         "swarm_collect",
+        "swarm_verify_agent",
         "swarm_record_blocker",
         "swarm_escalate",
         "swarm_list_escalations",
@@ -1537,10 +1654,11 @@ Commands:
   escalate --agent ID --question TEXT [--severity low|medium|high] [--context TEXT] [--evidence PATH] [--option TEXT] [--pause]
   escalations [--run ID] [--agent ID] [--status open|resolved]
   resolve-escalation --id ID --decision TEXT [--note TEXT]
-  decision --run ID --text TEXT [--rationale TEXT]
+  decision --run ID --text TEXT [--rationale TEXT] [--source TEXT] [--agent ID] [--task ID] [--queue ID]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
   continue-agent --agent ID [--activate]
+  verify-agent --agent ID [--timeout-ms N]
   complete-agent --agent ID
   doctor [--run ID] [--fix]
   ignore
@@ -1583,6 +1701,7 @@ function main() {
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");
   if (command === "continue-agent") return commandContinueAgent(cwd, args);
+  if (command === "verify-agent") return commandVerifyAgent(cwd, args);
   if (command === "complete-agent") return commandAgentStatus(cwd, args, "completed");
   if (command === "doctor") return commandDoctor(cwd, args);
   if (command === "ignore") return commandIgnore(cwd);

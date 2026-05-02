@@ -21,6 +21,7 @@
 - Add Level 3 taskboard enforcement for implementation work: review-required tasks must pass through `NEEDS_REVIEW`, cannot be closed by the review requester, may require an existing isolated worktree before claim, and greenlight-required tasks need an explicit greenlit checkpoint before `DONE`.
 - Add `unblocks` and `parentBlockedTask` taskboard fields so unblock/design work can be traceable to a blocked parent without being blocked by `dependsOn` semantics.
 - Add swarm-agent completion evidence metadata, including the initial task-file hash used by proof-gated completion checks.
+- Add monitor verification via `swarm_verify_agent` and `pi-ralph-swarm verify-agent`, plus queue delivery attempt audit metadata and optional decision provenance fields.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.
@@ -37,6 +38,7 @@
 - Count owned-path overlap only among non-terminal agents so completed historical writers do not keep closed boards at medium load.
 - Report completed swarm runs as closed in advice instead of recommending new work.
 - Enforce swarm-agent completion in Pi and `pi-ralph-swarm complete-agent`: new agents must mutate their task file and replace `## Final Verification` placeholders before they can be marked completed.
+- Require proof-gated swarm completion to have existing preserved artifacts and a passing monitor rerun for the current task-file hash.
 
 ## 0.2.0 - 2026-04-19
 

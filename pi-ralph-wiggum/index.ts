@@ -6,6 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -19,6 +20,7 @@ const FINAL_VERIFICATION_FIELDS = [
 	"Result",
 ];
 const FINAL_VERIFICATION_PLACEHOLDERS = new Set(["", "<command>", "<path>", "<paths>", "<output summary>"]);
+const NO_ARTIFACT_VALUES = new Set(["none", "n/a", "na", "not needed", "not applicable"]);
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -34,6 +36,7 @@ Describe your task here.
 
 ## Verification
 - Commands run, working directories, relevant environment variables, outputs, and preserved artifacts
+- Before completion, call swarm_verify_agent for this agent after Final Verification is updated
 
 ## Final Verification
 - Exact monitor-rerunnable command: <command>
@@ -53,7 +56,8 @@ Before completion:
 2. Record the exact command, working directory, relevant environment variables, and output summary in the task file.
 3. Preserve every artifact required by that command, including build directories, generated libraries, virtualenvs, caches, or copied dylibs.
 4. If cleanup removes required artifacts, recreate them or update the final command before completing.
-5. If the final command cannot be made externally rerunnable, mark the item blocked/deferred instead of complete.`;
+5. Call swarm_verify_agent after updating Final Verification, then complete only if the monitor pass succeeds for the current task file.
+6. If the final command cannot be made externally rerunnable, mark the item blocked/deferred instead of complete.`;
 
 const DEFAULT_STALE_PROMPT_GUARD = `STALE PROMPT GUARD
 
@@ -106,6 +110,10 @@ interface LoopState {
 interface SwarmDecision {
 	text: string;
 	rationale?: string;
+	source?: string;
+	agentId?: string;
+	taskId?: string;
+	queueId?: string;
 	createdAt: string;
 }
 
@@ -161,6 +169,33 @@ interface SwarmAgentCompletionEvidence {
 	completedTaskFileSize?: number;
 	completionCheckedAt?: string;
 	completionGateFailure?: string;
+	monitor?: SwarmAgentMonitorEvidence;
+}
+
+interface SwarmAgentMonitorEvidence {
+	verifiedAt: string;
+	taskFileHash: string;
+	command: string;
+	workingDirectory: string;
+	exitCode: number | null;
+	ok: boolean;
+	stdoutTail?: string;
+	stderrTail?: string;
+	error?: string;
+	artifacts: SwarmArtifactStatus[];
+}
+
+interface SwarmArtifactStatus {
+	path: string;
+	exists: boolean;
+}
+
+interface SwarmQueueDeliveryAttempt {
+	at: string;
+	status: string;
+	reason?: string;
+	queueGeneration: number;
+	promptHash?: string;
 }
 
 interface SwarmQueueRecord {
@@ -176,6 +211,7 @@ interface SwarmQueueRecord {
 	deliveredAt?: string;
 	deliveredBy?: string;
 	failureReason?: string;
+	deliveryAttempts: SwarmQueueDeliveryAttempt[];
 	promptFile: string;
 	stateFile: string;
 	taskFile: string;
@@ -410,13 +446,40 @@ export default function (pi: ExtensionAPI) {
 		return match ? match[1].trim() : undefined;
 	}
 
+	function cleanFinalVerificationValue(value: string | undefined): string {
+		return (value || "").trim().replace(/^`|`$/g, "").replace(/^['"]|['"]$/g, "").trim();
+	}
+
+	function finalVerificationFields(content: string): Record<string, string> {
+		const fields: Record<string, string> = {};
+		for (const label of FINAL_VERIFICATION_FIELDS) fields[label] = cleanFinalVerificationValue(finalVerificationValue(content, label));
+		return fields;
+	}
+
+	function parseArtifactPaths(value: string): string[] {
+		const cleaned = cleanFinalVerificationValue(value);
+		if (NO_ARTIFACT_VALUES.has(cleaned.toLowerCase())) return [];
+		return cleaned
+			.split(",")
+			.map((item) => cleanFinalVerificationValue(item.trim()))
+			.filter((item) => item.length > 0 && !NO_ARTIFACT_VALUES.has(item.toLowerCase()));
+	}
+
+	function artifactStatuses(workingDirectory: string, artifactField: string): SwarmArtifactStatus[] {
+		return parseArtifactPaths(artifactField).map((artifactPath) => {
+			const resolved = path.isAbsolute(artifactPath) ? artifactPath : path.resolve(workingDirectory, artifactPath);
+			return { path: artifactPath, exists: fs.existsSync(resolved) };
+		});
+	}
+
 	function validateFinalVerification(content: string): string[] {
 		const reasons: string[] = [];
 		for (const label of FINAL_VERIFICATION_FIELDS) {
 			const value = finalVerificationValue(content, label);
+			const cleaned = cleanFinalVerificationValue(value);
 			if (value === undefined) {
 				reasons.push(`missing Final Verification field: ${label}`);
-			} else if (FINAL_VERIFICATION_PLACEHOLDERS.has(value.toLowerCase())) {
+			} else if (FINAL_VERIFICATION_PLACEHOLDERS.has(cleaned.toLowerCase())) {
 				reasons.push(`placeholder Final Verification field: ${label}`);
 			}
 		}
@@ -431,9 +494,63 @@ export default function (pi: ExtensionAPI) {
 		const content = fs.readFileSync(taskFile, "utf-8");
 		const hash = sha256(content);
 		const reasons = validateFinalVerification(content);
+		const fields = finalVerificationFields(content);
+		const workingDirectory = fields["Working directory"];
+		if (workingDirectory && !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory}`);
+		const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
+		for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
+		const monitor = agent.completionEvidence?.monitor;
+		if (!monitor) reasons.push("missing monitor verification: run swarm_verify_agent first");
+		else {
+			if (!monitor.ok || monitor.exitCode !== 0) reasons.push(`monitor verification failed: exit=${monitor.exitCode}`);
+			if (monitor.taskFileHash !== hash) reasons.push("monitor verification is stale for current task file");
+			if (monitor.command !== fields["Exact monitor-rerunnable command"]) reasons.push("monitor verification command differs from current Final Verification command");
+			if (monitor.workingDirectory !== workingDirectory) reasons.push("monitor verification working directory differs from current Final Verification working directory");
+			for (const artifact of monitor.artifacts || []) if (!artifact.exists) reasons.push(`monitor artifact missing: ${artifact.path}`);
+		}
 		const initialHash = agent.completionEvidence?.initialTaskFileHash;
 		if (initialHash && hash === initialHash) reasons.push("task file unchanged since agent creation");
 		return { ok: reasons.length === 0, reasons, hash, size: Buffer.byteLength(content, "utf-8") };
+	}
+
+	function tailOutput(value: string | undefined): string | undefined {
+		if (!value) return undefined;
+		return value.length > 4000 ? value.slice(value.length - 4000) : value;
+	}
+
+	function verifySwarmAgent(ctx: ExtensionContext, agent: SwarmAgent, timeoutMs = 120000): string {
+		const taskFile = path.resolve(ctx.cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
+		if (!fs.existsSync(taskFile)) return `Verification failed for ${agent.id}: task file not found: ${path.relative(ctx.cwd, taskFile)}`;
+		const content = fs.readFileSync(taskFile, "utf-8");
+		const hash = sha256(content);
+		const reasons = validateFinalVerification(content);
+		const fields = finalVerificationFields(content);
+		const command = fields["Exact monitor-rerunnable command"];
+		const workingDirectory = fields["Working directory"];
+		if (!workingDirectory || !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory || "(missing)"}`);
+		const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
+		for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
+
+		let exitCode: number | null = null;
+		let stdoutTail: string | undefined;
+		let stderrTail: string | undefined;
+		let errorText: string | undefined;
+		if (reasons.length === 0) {
+			const result = spawnSync(command, { cwd: workingDirectory, shell: true, encoding: "utf-8", timeout: timeoutMs });
+			exitCode = result.status;
+			stdoutTail = tailOutput(result.stdout);
+			stderrTail = tailOutput(result.stderr);
+			if (result.error) errorText = result.error.message;
+			if (result.error) reasons.push(`monitor command error: ${result.error.message}`);
+			if (result.status !== 0) reasons.push(`monitor command failed: exit=${result.status}`);
+		}
+		const ok = reasons.length === 0;
+		agent.completionEvidence = {
+			...(agent.completionEvidence || {}),
+			monitor: { verifiedAt: nowIso(), taskFileHash: hash, command, workingDirectory, exitCode, ok, stdoutTail, stderrTail, error: errorText, artifacts },
+		};
+		saveSwarmAgent(ctx, agent);
+		return ok ? `Verified ${agent.id}: ${command}` : `Verification failed for ${agent.id}: ${reasons.join("; ")}`;
 	}
 
 	function recordCompletionCheck(agent: SwarmAgent, validation: { ok: boolean; reasons: string[]; hash?: string; size?: number }): void {
@@ -513,6 +630,7 @@ export default function (pi: ExtensionAPI) {
 			deliveredAt: raw.deliveredAt,
 			deliveredBy: raw.deliveredBy,
 			failureReason: raw.failureReason,
+			deliveryAttempts: Array.isArray(raw.deliveryAttempts) ? raw.deliveryAttempts : [],
 			promptFile: raw.promptFile || path.join(SWARM_DIR, "queue", `${sanitize(raw.id)}.prompt.md`),
 			stateFile: raw.stateFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.state.json`),
 			taskFile: raw.taskFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.md`),
@@ -987,7 +1105,8 @@ export default function (pi: ExtensionAPI) {
 			.map((record) => {
 				const delivered = record.deliveredAt ? ` delivered=${record.deliveredAt}` : "";
 				const failure = record.failureReason ? ` failure=${record.failureReason}` : "";
-				return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration}, queued=${record.queuedAt}${delivered}${failure}`;
+				const attempts = record.deliveryAttempts.length ? ` attempts=${record.deliveryAttempts.length}` : "";
+				return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration}, queued=${record.queuedAt}${delivered}${failure}${attempts}`;
 			})
 			.join("\n");
 	}
@@ -1303,6 +1422,23 @@ export default function (pi: ExtensionAPI) {
 		return record;
 	}
 
+	function queuePromptHash(ctx: ExtensionContext, record: SwarmQueueRecord): string | undefined {
+		const prompt = tryRead(path.resolve(ctx.cwd, record.promptFile));
+		return prompt ? sha256(prompt) : undefined;
+	}
+
+	function recordQueueAttempt(ctx: ExtensionContext, record: SwarmQueueRecord, status: string, reason?: string): SwarmQueueRecord {
+		record.deliveryAttempts = [...(record.deliveryAttempts || []), {
+			at: nowIso(),
+			status,
+			reason,
+			queueGeneration: record.queueGeneration ?? 0,
+			promptHash: queuePromptHash(ctx, record),
+		}];
+		saveSwarmQueueRecord(ctx, record);
+		return record;
+	}
+
 	function markQueueRecord(ctx: ExtensionContext, record: SwarmQueueRecord, status: SwarmQueueStatus, failureReason?: string): SwarmQueueRecord {
 		record.status = status;
 		if (status === "delivered") {
@@ -1310,13 +1446,23 @@ export default function (pi: ExtensionAPI) {
 			record.deliveredBy = "pi-ralph-wiggum";
 		}
 		if (failureReason) record.failureReason = failureReason;
+		record.deliveryAttempts = [...(record.deliveryAttempts || []), {
+			at: nowIso(),
+			status,
+			reason: failureReason,
+			queueGeneration: record.queueGeneration ?? 0,
+			promptHash: queuePromptHash(ctx, record),
+		}];
 		saveSwarmQueueRecord(ctx, record);
 		return record;
 	}
 
 	function deliverQueuedSwarmPrompt(ctx: ExtensionContext, record: SwarmQueueRecord): string {
 		if (record.status !== "queued") return `${record.id}: skipped (${record.status})`;
-		if (ctx.hasPendingMessages()) return `${record.id}: pending Pi messages already queued; drain later`;
+		if (ctx.hasPendingMessages()) {
+			recordQueueAttempt(ctx, record, "pending", "Pi messages already queued");
+			return `${record.id}: pending Pi messages already queued; drain later`;
+		}
 
 		const agent = loadSwarmAgent(ctx, record.agentId);
 		if (!agent) {
@@ -1328,7 +1474,10 @@ export default function (pi: ExtensionAPI) {
 			return `${record.id}: stale (agent cancelled)`;
 		}
 		const dependencies = swarmDependencyReport(ctx, record.runId, syncSwarmAgentFromLoop(ctx, agent));
-		if (!dependencies.ready) return `${record.id}: blocked (waiting for ${dependencies.waiting.join(", ")})`;
+		if (!dependencies.ready) {
+			recordQueueAttempt(ctx, record, "blocked", `waiting for ${dependencies.waiting.join(", ")}`);
+			return `${record.id}: blocked (waiting for ${dependencies.waiting.join(", ")})`;
+		}
 
 		const state = loadState(ctx, record.loopName);
 		if (!state) {
@@ -1589,8 +1738,9 @@ ${taskContent}
 			parts.push(`1. Continue working on the task`);
 		}
 		parts.push(`2. Update the task file (${state.taskFile}) with your progress`);
-		parts.push(`3. When FULLY COMPLETE and the completion gate is satisfied, respond with: ${COMPLETE_MARKER}`);
-		parts.push(`4. Otherwise, call ralph_done with {"name":"${state.name}"} to proceed to next iteration`);
+		parts.push(`3. If this is a swarm agent, call swarm_verify_agent after Final Verification is updated`);
+		parts.push(`4. When FULLY COMPLETE and the completion gate is satisfied, respond with: ${COMPLETE_MARKER}`);
+		parts.push(`5. Otherwise, call ralph_done with {"name":"${state.name}"} to proceed to next iteration`);
 
 		return parts.join("\n");
 	}
@@ -2496,6 +2646,22 @@ Agents should use the swarm_* tools for structured orchestration.`;
 	});
 
 	pi.registerTool({
+		name: "swarm_verify_agent",
+		label: "Verify Swarm Agent",
+		description: "Run a swarm agent's recorded Final Verification command and store monitor evidence required for completion.",
+		parameters: Type.Object({
+			agentId: Type.String(),
+			timeoutMs: Type.Optional(Type.Number({ default: 120000 })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const text = verifySwarmAgent(ctx, agent, params.timeoutMs ?? 120000);
+			return { content: [{ type: "text", text }], details: { agentId: agent.id } };
+		},
+	});
+
+	pi.registerTool({
 		name: "swarm_list_queue",
 		label: "List Swarm Queue",
 		description: "List CLI-created swarm prompt queue records awaiting Pi/Ralph delivery.",
@@ -2755,11 +2921,15 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			runId: Type.String(),
 			decision: Type.String(),
 			rationale: Type.Optional(Type.String()),
+			source: Type.Optional(Type.String()),
+			agentId: Type.Optional(Type.String()),
+			taskId: Type.Optional(Type.String()),
+			queueId: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const run = loadSwarmRun(ctx, params.runId);
 			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
-			run.decisions.push({ text: params.decision, rationale: params.rationale, createdAt: nowIso() });
+			run.decisions.push({ text: params.decision, rationale: params.rationale, source: params.source, agentId: params.agentId, taskId: params.taskId, queueId: params.queueId, createdAt: nowIso() });
 			saveSwarmRun(ctx, run);
 			updateUI(ctx);
 			return { content: [{ type: "text", text: `Recorded decision for ${run.id}: ${params.decision}` }], details: {} };
@@ -2943,6 +3113,7 @@ Agents should use the swarm_* tools for structured orchestration.`;
 		instructions += `- Update the task file as you progress\n`;
 		instructions += `- Preserve artifacts needed by final verification\n`;
 		instructions += `- Record an exact monitor-rerunnable final command before completion\n`;
+		instructions += `- If this is a swarm agent, call swarm_verify_agent before completion so monitor evidence is recorded\n`;
 		instructions += `- When FULLY COMPLETE and externally rerunnable: ${COMPLETE_MARKER}\n`;
 		instructions += `- Otherwise, call ralph_done with {"name":"${state.name}"} to proceed to next iteration`;
 

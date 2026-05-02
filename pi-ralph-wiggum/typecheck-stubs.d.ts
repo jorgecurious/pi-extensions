@@ -15,8 +15,13 @@ declare module "node:path" {
   export const dirname: any;
   export const extname: any;
   export const join: any;
+  export const isAbsolute: any;
   export const relative: any;
   export const resolve: any;
+}
+
+declare module "node:child_process" {
+  export const spawnSync: any;
 }
 
 declare module "node:crypto" {

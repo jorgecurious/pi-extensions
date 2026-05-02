@@ -61,7 +61,7 @@ For build/test/refactor tasks, Ralph prompts the agent not to complete based onl
 - Ensure a separate monitor can rerun that command from the same worktree in a fresh shell.
 - Mark work blocked or deferred if the final command cannot be made externally rerunnable.
 
-Swarm agents also enforce this gate in state. New agents record the initial task-file hash at spawn time, and completion via Pi or `pi-ralph-swarm complete-agent` is blocked unless the task file changed and the `## Final Verification` fields contain non-placeholder values for the command, working directory, preserved artifacts, and result.
+Swarm agents also enforce this gate in state. New agents record the initial task-file hash at spawn time, and completion via Pi or `pi-ralph-swarm complete-agent` is blocked unless the task file changed, the `## Final Verification` fields contain non-placeholder values, required artifacts exist, and `swarm_verify_agent` or `pi-ralph-swarm verify-agent` has successfully rerun the recorded command for the current task-file hash.
 
 ## Stale prompt guard
 
@@ -138,6 +138,7 @@ Additional tools:
 - `swarm_list_agents`: list run agents with statuses and loop names.
 - `swarm_cognitive_load`: return the load score and reasons.
 - `swarm_collect`: read a subagent's task-file evidence.
+- `swarm_verify_agent`: run a subagent's recorded final verification command and store monitor evidence required for completion.
 - `swarm_list_queue`: list CLI-created prompt queue records.
 - `swarm_next_ready`: show dependency-unblocked queued prompts and paused agents ready to enqueue.
 - `swarm_prune_queue`: mark queued records stale when their agent/loop is terminal or prompt is no longer deliverable.
@@ -202,6 +203,7 @@ pi-ralph-swarm resolve-escalation --id ESCALATION_ID --decision "Pause writer an
 pi-ralph-swarm status --run metal-pr-review
 pi-ralph-swarm continue-agent --agent swarm-metal-pr-review-verifier-1 --activate
 pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
+pi-ralph-swarm verify-agent --agent swarm-metal-pr-review-verifier-1 --timeout-ms 120000
 pi-ralph-swarm doctor --run metal-pr-review --fix
 ```
 
@@ -260,7 +262,7 @@ Contracts may include `setupNotes` and `verificationEnvironment` at the contract
 
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
 
-Completion is proof-gated for CLI-created swarm agents too. `pi-ralph-swarm complete-agent` refuses to mark a new agent complete if its task file is unchanged from spawn time or still contains placeholder `## Final Verification` values.
+Completion is proof-gated for CLI-created swarm agents too. `pi-ralph-swarm complete-agent` refuses to mark a new agent complete if its task file is unchanged from spawn time, still contains placeholder `## Final Verification` values, references missing artifacts, or lacks a passing `pi-ralph-swarm verify-agent` monitor record for the current task-file hash.
 
 Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for an agent. The CLI writes `.ralph/swarm/queue/*.json` and `.prompt.md` records and marks the agent `queued`; Pi/Ralph still owns actual prompt delivery and execution. Queue creation is never reported as completed work. If the loop is already completed, pass `--continue-completed` to append a new iteration intentionally; otherwise completed-loop queue records are rejected to preserve the stale-prompt guard.
 
