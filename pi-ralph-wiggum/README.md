@@ -61,6 +61,8 @@ For build/test/refactor tasks, Ralph prompts the agent not to complete based onl
 - Ensure a separate monitor can rerun that command from the same worktree in a fresh shell.
 - Mark work blocked or deferred if the final command cannot be made externally rerunnable.
 
+Swarm agents also enforce this gate in state. New agents record the initial task-file hash at spawn time, and completion via Pi or `pi-ralph-swarm complete-agent` is blocked unless the task file changed and the `## Final Verification` fields contain non-placeholder values for the command, working directory, preserved artifacts, and result.
+
 ## Stale prompt guard
 
 If an already-queued Ralph prompt arrives after a loop has completed, the agent should reload `.ralph/<name>.state.json` before doing work. If the loop state is `completed`, it should ignore the stale prompt, avoid file edits and task commands, and not call `ralph_done`. To intentionally append more work to a completed loop, use `/ralph resume <name>`, `swarm_continue_agent`, or `pi-ralph-swarm enqueue --continue-completed`; these paths create a new iteration and clear the completed state before delivering a prompt.
@@ -257,6 +259,8 @@ Dependency order is enforced at queue-drain time. `dependsOn` entries are resolv
 Contracts may include `setupNotes` and `verificationEnvironment` at the contract, phase, or agent level. These notes are copied into generated task files so verifiers can preserve required build artifacts, env vars, submodule paths, or other monitor-rerunnable setup details.
 
 The CLI intentionally manipulates the same `.ralph/<loop>.md`, `.ralph/<loop>.state.json`, and `.ralph/swarm/*.json` files used by the Pi extension. It is a local state/control shim: it can create queue records, but it does not execute prompts itself.
+
+Completion is proof-gated for CLI-created swarm agents too. `pi-ralph-swarm complete-agent` refuses to mark a new agent complete if its task file is unchanged from spawn time or still contains placeholder `## Final Verification` values.
 
 Use `pi-ralph-swarm enqueue` to generate a Ralph-compatible follow-up prompt for an agent. The CLI writes `.ralph/swarm/queue/*.json` and `.prompt.md` records and marks the agent `queued`; Pi/Ralph still owns actual prompt delivery and execution. Queue creation is never reported as completed work. If the loop is already completed, pass `--continue-completed` to append a new iteration intentionally; otherwise completed-loop queue records are rejected to preserve the stale-prompt guard.
 

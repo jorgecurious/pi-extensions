@@ -5,12 +5,20 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 const RALPH_DIR = ".ralph";
 const SWARM_DIR = path.join(RALPH_DIR, "swarm");
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
+const FINAL_VERIFICATION_FIELDS = [
+	"Exact monitor-rerunnable command",
+	"Working directory",
+	"Required preserved artifacts",
+	"Result",
+];
+const FINAL_VERIFICATION_PLACEHOLDERS = new Set(["", "<command>", "<path>", "<paths>", "<output summary>"]);
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -140,8 +148,19 @@ interface SwarmAgent {
 	reflectEvery: number;
 	lastSummary?: string;
 	lastQueueFile?: string;
+	completionEvidence?: SwarmAgentCompletionEvidence;
 	createdAt: string;
 	updatedAt: string;
+}
+
+interface SwarmAgentCompletionEvidence {
+	initialTaskFileHash?: string;
+	initialTaskFileSize?: number;
+	initialTaskFileRecordedAt?: string;
+	completedTaskFileHash?: string;
+	completedTaskFileSize?: number;
+	completionCheckedAt?: string;
+	completionGateFailure?: string;
 }
 
 interface SwarmQueueRecord {
@@ -369,6 +388,69 @@ export default function (pi: ExtensionAPI) {
 		return new Date().toISOString();
 	}
 
+	function sha256(content: string): string {
+		return crypto.createHash("sha256").update(content).digest("hex");
+	}
+
+	function taskEvidence(content: string): SwarmAgentCompletionEvidence {
+		return {
+			initialTaskFileHash: sha256(content),
+			initialTaskFileSize: Buffer.byteLength(content, "utf-8"),
+			initialTaskFileRecordedAt: nowIso(),
+		};
+	}
+
+	function escapeRegExp(value: string): string {
+		return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+
+	function finalVerificationValue(content: string, label: string): string | undefined {
+		const pattern = new RegExp(`^\\s*-\\s*${escapeRegExp(label)}\\s*:\\s*(.*)\\s*$`, "im");
+		const match = content.match(pattern);
+		return match ? match[1].trim() : undefined;
+	}
+
+	function validateFinalVerification(content: string): string[] {
+		const reasons: string[] = [];
+		for (const label of FINAL_VERIFICATION_FIELDS) {
+			const value = finalVerificationValue(content, label);
+			if (value === undefined) {
+				reasons.push(`missing Final Verification field: ${label}`);
+			} else if (FINAL_VERIFICATION_PLACEHOLDERS.has(value.toLowerCase())) {
+				reasons.push(`placeholder Final Verification field: ${label}`);
+			}
+		}
+		return reasons;
+	}
+
+	function validateAgentCompletion(ctx: ExtensionContext, agent: SwarmAgent): { ok: boolean; reasons: string[]; hash?: string; size?: number } {
+		const taskFile = path.resolve(ctx.cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
+		if (!fs.existsSync(taskFile)) {
+			return { ok: false, reasons: [`task file not found: ${path.relative(ctx.cwd, taskFile)}`] };
+		}
+		const content = fs.readFileSync(taskFile, "utf-8");
+		const hash = sha256(content);
+		const reasons = validateFinalVerification(content);
+		const initialHash = agent.completionEvidence?.initialTaskFileHash;
+		if (initialHash && hash === initialHash) reasons.push("task file unchanged since agent creation");
+		return { ok: reasons.length === 0, reasons, hash, size: Buffer.byteLength(content, "utf-8") };
+	}
+
+	function recordCompletionCheck(agent: SwarmAgent, validation: { ok: boolean; reasons: string[]; hash?: string; size?: number }): void {
+		agent.completionEvidence = {
+			...(agent.completionEvidence || {}),
+			completedTaskFileHash: validation.hash,
+			completedTaskFileSize: validation.size,
+			completionCheckedAt: nowIso(),
+			completionGateFailure: validation.ok ? undefined : validation.reasons.join("; "),
+		};
+		if (validation.ok) delete agent.completionEvidence.completionGateFailure;
+	}
+
+	function completionGateFailure(agent: SwarmAgent, validation: { reasons: string[] }): string {
+		return `Completion gate failed for ${agent.id}: ${validation.reasons.join("; ")}`;
+	}
+
 	function normalizeStringList(value: unknown): string[] {
 		return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
 	}
@@ -393,6 +475,7 @@ export default function (pi: ExtensionAPI) {
 
 	function migrateSwarmAgent(raw: Partial<SwarmAgent> & { id: string; runId: string; loopName: string }): SwarmAgent {
 		const timestamp = nowIso();
+		const completionEvidence = raw.completionEvidence && typeof raw.completionEvidence === "object" ? raw.completionEvidence : undefined;
 		return {
 			id: sanitize(raw.id),
 			runId: sanitize(raw.runId),
@@ -410,6 +493,7 @@ export default function (pi: ExtensionAPI) {
 			reflectEvery: raw.reflectEvery ?? 5,
 			lastSummary: raw.lastSummary,
 			lastQueueFile: raw.lastQueueFile,
+			completionEvidence,
 			createdAt: raw.createdAt || timestamp,
 			updatedAt: raw.updatedAt || timestamp,
 		};
@@ -653,21 +737,60 @@ export default function (pi: ExtensionAPI) {
 	function syncSwarmAgentFromLoop(ctx: ExtensionContext, agent: SwarmAgent): SwarmAgent {
 		const loop = loadState(ctx, agent.loopName);
 		if (!loop) return agent;
-		if (loop.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
+		if (loop.status === "completed" && agent.status !== "cancelled" && agent.status !== "completed") {
+			const validation = validateAgentCompletion(ctx, agent);
+			recordCompletionCheck(agent, validation);
+			if (validation.ok) agent.status = "completed";
+			else {
+				agent.status = "blocked";
+				agent.lastSummary = completionGateFailure(agent, validation);
+			}
+		}
 		else if (loop.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "paused";
 		else if (loop.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
 		saveSwarmAgent(ctx, agent);
 		return agent;
 	}
 
-	function markSwarmAgentByLoop(ctx: ExtensionContext, loopName: string, status: SwarmAgentStatus): void {
+	function markSwarmAgentByLoop(ctx: ExtensionContext, loopName: string, status: SwarmAgentStatus): string[] {
+		const failures: string[] = [];
 		for (const agent of listSwarmAgents(ctx)) {
 			if (agent.loopName !== loopName) continue;
+			if (status === "completed" && agent.status !== "completed") {
+				const validation = validateAgentCompletion(ctx, agent);
+				recordCompletionCheck(agent, validation);
+				if (!validation.ok) {
+					agent.status = "blocked";
+					agent.lastSummary = completionGateFailure(agent, validation);
+					failures.push(agent.lastSummary);
+					saveSwarmAgent(ctx, agent);
+					continue;
+				}
+			}
 			agent.status = status;
 			saveSwarmAgent(ctx, agent);
 			const run = loadSwarmRun(ctx, agent.runId);
 			if (run) saveSwarmRun(ctx, run);
 		}
+		return failures;
+	}
+
+	function swarmCompletionGateFailures(ctx: ExtensionContext, loopName: string): string[] {
+		const failures: string[] = [];
+		for (const agent of listSwarmAgents(ctx)) {
+			if (agent.loopName !== loopName || agent.status === "completed" || agent.status === "cancelled") continue;
+			const validation = validateAgentCompletion(ctx, agent);
+			recordCompletionCheck(agent, validation);
+			if (validation.ok) {
+				saveSwarmAgent(ctx, agent);
+				continue;
+			}
+			agent.status = "blocked";
+			agent.lastSummary = completionGateFailure(agent, validation);
+			failures.push(agent.lastSummary);
+			saveSwarmAgent(ctx, agent);
+		}
+		return failures;
 	}
 
 	function cognitiveLoad(ctx: ExtensionContext, run: SwarmRun): CognitiveLoadReport {
@@ -1324,7 +1447,24 @@ ${taskContent}
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
 	}
 
-	function completeLoop(ctx: ExtensionContext, state: LoopState, banner: string): void {
+	function formatCompletionGateFailures(loopName: string, failures: string[]): string {
+		return `Ralph completion blocked for ${loopName}. Update the task file with changed evidence and concrete Final Verification fields before completing.\n${failures.map((failure) => `- ${failure}`).join("\n")}`;
+	}
+
+	function completeLoop(ctx: ExtensionContext, state: LoopState, banner: string): boolean {
+		const failures = swarmCompletionGateFailures(ctx, state.name);
+		if (failures.length > 0) {
+			state.status = "paused";
+			state.active = false;
+			saveState(ctx, state);
+			currentLoop = null;
+			updateUI(ctx);
+			pi.sendUserMessage(formatCompletionGateFailures(state.name, failures), {
+				deliverAs: "followUp",
+				streamingBehavior: "followUp",
+			});
+			return false;
+		}
 		state.status = "completed";
 		state.completedAt = new Date().toISOString();
 		state.active = false;
@@ -1336,9 +1476,20 @@ ${taskContent}
 			deliverAs: "followUp",
 			streamingBehavior: "followUp",
 		});
+		return true;
 	}
 
-	function stopLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
+	function stopLoop(ctx: ExtensionContext, state: LoopState, message?: string): boolean {
+		const failures = swarmCompletionGateFailures(ctx, state.name);
+		if (failures.length > 0) {
+			state.status = "paused";
+			state.active = false;
+			saveState(ctx, state);
+			currentLoop = null;
+			updateUI(ctx);
+			if (ctx.hasUI) ctx.ui.notify(formatCompletionGateFailures(state.name, failures), "warning");
+			return false;
+		}
 		state.status = "completed";
 		state.completedAt = new Date().toISOString();
 		state.active = false;
@@ -1347,6 +1498,7 @@ ${taskContent}
 		currentLoop = null;
 		updateUI(ctx);
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
+		return true;
 	}
 
 	// --- UI ---
@@ -1486,14 +1638,14 @@ ${taskContent}
 		state.iteration++;
 
 		if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
-			completeLoop(
+			const completed = completeLoop(
 				ctx,
 				state,
 				`───────────────────────────────────────────────────────────────────────
 ⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
 ──────────────────────────────────────────────────────────────────────`,
 			);
-			return "Max iterations reached. Loop stopped.";
+			return completed ? "Max iterations reached. Loop stopped." : "Max iterations reached, but completion gate blocked the swarm agent.";
 		}
 
 		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
@@ -2246,6 +2398,7 @@ Agents should use the swarm_* tools for structured orchestration.`;
 				maxIterations: loopState.maxIterations,
 				itemsPerIteration: loopState.itemsPerIteration,
 				reflectEvery: loopState.reflectEvery,
+				completionEvidence: taskEvidence(taskContent),
 				createdAt: nowIso(),
 				updatedAt: nowIso(),
 			};
@@ -2734,14 +2887,17 @@ Agents should use the swarm_* tools for structured orchestration.`;
 
 			// Check max iterations
 			if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
-				completeLoop(
+				const completed = completeLoop(
 					ctx,
 					state,
 					`───────────────────────────────────────────────────────────────────────
 ⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
 ───────────────────────────────────────────────────────────────────────`,
 				);
-				return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: {} };
+				return {
+					content: [{ type: "text", text: completed ? "Max iterations reached. Loop stopped." : "Max iterations reached, but completion gate blocked the swarm agent." }],
+					details: {},
+				};
 			}
 
 			const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;

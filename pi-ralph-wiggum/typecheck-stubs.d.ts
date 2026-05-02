@@ -19,6 +19,14 @@ declare module "node:path" {
   export const resolve: any;
 }
 
+declare module "node:crypto" {
+  export const createHash: any;
+}
+
+declare const Buffer: {
+  byteLength(value: string, encoding?: string): number;
+};
+
 declare module "@mariozechner/pi-coding-agent" {
   export type ExtensionAPI = any;
   export type ExtensionContext = any;

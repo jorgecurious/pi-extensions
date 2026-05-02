@@ -101,6 +101,8 @@ Before emitting `<promise>COMPLETE</promise>`:
 - If a test cannot be rerun externally, mark the item blocked or deferred instead of complete.
 - If cleanup removes required verification artifacts, recreate them or update the final command before completion.
 
+For swarm agents, this is enforced by state as well as instruction. New agents record the initial task-file hash, and Pi/CLI completion is blocked unless the task file changed and `## Final Verification` has non-placeholder command, working directory, preserved-artifact, and result values.
+
 ## Stale Prompt Guard
 
 Before doing any work from a Ralph prompt, reload `.ralph/<name>.state.json`. If the loop state says `"status": "completed"`, do not edit files, do not run task commands, and do not call `ralph_done`. Reply briefly that the stale prompt was ignored because the loop is already completed. The manager can intentionally continue a completed loop with `/ralph resume`, `swarm_continue_agent`, or `pi-ralph-swarm enqueue --continue-completed`; only then should the next prompt be treated as live work.

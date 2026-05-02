@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const RALPH_DIR = ".ralph";
@@ -19,6 +20,13 @@ const PHASE_AGENT_KINDS = new Map([
   ["debugger", "writer"],
   ["verifier", "verifier"],
 ]);
+const FINAL_VERIFICATION_FIELDS = [
+  "Exact monitor-rerunnable command",
+  "Working directory",
+  "Required preserved artifacts",
+  "Result",
+];
+const FINAL_VERIFICATION_PLACEHOLDERS = new Set(["", "<command>", "<path>", "<paths>", "<output summary>"]);
 
 const COMPLETION_GATE = `COMPLETION GATE
 
@@ -56,6 +64,69 @@ function readJson(filePath) {
 function writeJson(filePath, value) {
   ensureDir(filePath);
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function sha256(content) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function taskEvidence(content) {
+  return {
+    initialTaskFileHash: sha256(content),
+    initialTaskFileSize: Buffer.byteLength(content, "utf8"),
+    initialTaskFileRecordedAt: nowIso(),
+  };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function finalVerificationValue(content, label) {
+  const pattern = new RegExp(`^\\s*-\\s*${escapeRegExp(label)}\\s*:\\s*(.*)\\s*$`, "im");
+  const match = content.match(pattern);
+  return match ? match[1].trim() : undefined;
+}
+
+function validateFinalVerification(content) {
+  const reasons = [];
+  for (const label of FINAL_VERIFICATION_FIELDS) {
+    const value = finalVerificationValue(content, label);
+    if (value === undefined) {
+      reasons.push(`missing Final Verification field: ${label}`);
+    } else if (FINAL_VERIFICATION_PLACEHOLDERS.has(value.toLowerCase())) {
+      reasons.push(`placeholder Final Verification field: ${label}`);
+    }
+  }
+  return reasons;
+}
+
+function validateAgentCompletion(cwd, agent) {
+  const taskFile = path.resolve(cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
+  if (!fs.existsSync(taskFile)) {
+    return { ok: false, reasons: [`task file not found: ${path.relative(cwd, taskFile)}`] };
+  }
+  const content = fs.readFileSync(taskFile, "utf8");
+  const hash = sha256(content);
+  const reasons = validateFinalVerification(content);
+  const initialHash = agent.completionEvidence?.initialTaskFileHash;
+  if (initialHash && hash === initialHash) reasons.push("task file unchanged since agent creation");
+  return { ok: reasons.length === 0, reasons, hash, size: Buffer.byteLength(content, "utf8") };
+}
+
+function recordCompletionCheck(agent, validation) {
+  agent.completionEvidence = {
+    ...(agent.completionEvidence || {}),
+    completedTaskFileHash: validation.hash,
+    completedTaskFileSize: validation.size,
+    completionCheckedAt: nowIso(),
+    completionGateFailure: validation.ok ? undefined : validation.reasons.join("; "),
+  };
+  if (validation.ok) delete agent.completionEvidence.completionGateFailure;
+}
+
+function completionGateFailure(agent, validation) {
+  return `Completion gate failed for ${agent.id}: ${validation.reasons.join("; ")}`;
 }
 
 function runPath(cwd, runId) {
@@ -186,7 +257,15 @@ function syncAgent(cwd, agent) {
   const stateFile = loopStatePath(cwd, agent.loopName);
   if (!fs.existsSync(stateFile)) return agent;
   const state = readJson(stateFile);
-  if (state.status === "completed" && agent.status !== "cancelled") agent.status = "completed";
+  if (state.status === "completed" && agent.status !== "cancelled" && agent.status !== "completed") {
+    const validation = validateAgentCompletion(cwd, agent);
+    recordCompletionCheck(agent, validation);
+    if (validation.ok) agent.status = "completed";
+    else {
+      agent.status = "blocked";
+      agent.lastSummary = completionGateFailure(agent, validation);
+    }
+  }
   else if (state.status === "paused" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "paused";
   else if (state.status === "active" && agent.status !== "blocked" && agent.status !== "cancelled" && agent.status !== "queued") agent.status = "active";
   agent.updatedAt = nowIso();
@@ -562,8 +641,9 @@ function createSwarmAgent(cwd, run, options) {
     if (collisions.length) throw new Error(`swarm agent already exists for ${loopName}: ${collisions.map((filePath) => path.relative(cwd, filePath)).join(", ")}`);
   }
 
+  const taskContent = defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths, setupNotes);
   ensureDir(taskFile);
-  fs.writeFileSync(taskFile, defaultAgentTask(run, role, task, mode, allowedPaths, ownedPaths, setupNotes), "utf8");
+  fs.writeFileSync(taskFile, taskContent, "utf8");
 
   const state = {
     name: loopName,
@@ -595,6 +675,7 @@ function createSwarmAgent(cwd, run, options) {
     maxIterations: state.maxIterations,
     itemsPerIteration: state.itemsPerIteration,
     reflectEvery: state.reflectEvery,
+    completionEvidence: taskEvidence(taskContent),
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
@@ -866,6 +947,17 @@ function commandRecord(cwd, args, kind) {
 
 function commandAgentStatus(cwd, args, status) {
   const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
+  if (status === "completed" && agent.status !== "completed") {
+    const validation = validateAgentCompletion(cwd, agent);
+    recordCompletionCheck(agent, validation);
+    if (!validation.ok) {
+      agent.status = "blocked";
+      agent.lastSummary = completionGateFailure(agent, validation);
+      agent.updatedAt = nowIso();
+      writeJson(agentPath(cwd, agent.id), agent);
+      throw new Error(agent.lastSummary);
+    }
+  }
   agent.status = status;
   agent.updatedAt = nowIso();
   writeJson(agentPath(cwd, agent.id), agent);
@@ -1466,7 +1558,7 @@ function main() {
     const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
     return runId ? renderBoard(cwd, loadRun(cwd, runId)) : "No swarm runs found.";
   }
-  if (command === "agents") return listAgents(cwd, value(args, "--run")).map((agent) => `${agent.id}: ${agent.status}, ${agent.mode}, loop=${agent.loopName}`).join("\n") || "No agents found.";
+  if (command === "agents") return listAgents(cwd, value(args, "--run")).map((agent) => syncAgent(cwd, agent)).map((agent) => `${agent.id}: ${agent.status}, ${agent.mode}, loop=${agent.loopName}`).join("\n") || "No agents found.";
   if (command === "collect") {
     const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
     return fs.readFileSync(path.join(cwd, agent.taskFile), "utf8");
