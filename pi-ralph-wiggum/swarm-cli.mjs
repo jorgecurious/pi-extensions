@@ -3,8 +3,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  completionGateFailure,
+  queueAttempt,
+  recordCompletionCheck,
+  sha256,
+  taskEvidence,
+  validateAgentCompletion,
+  verifyAgent,
+} from "./completion-gate.mjs";
 
 const RALPH_DIR = ".ralph";
 const SWARM_DIR = path.join(RALPH_DIR, "swarm");
@@ -20,15 +28,6 @@ const PHASE_AGENT_KINDS = new Map([
   ["debugger", "writer"],
   ["verifier", "verifier"],
 ]);
-const FINAL_VERIFICATION_FIELDS = [
-  "Exact monitor-rerunnable command",
-  "Working directory",
-  "Required preserved artifacts",
-  "Result",
-];
-const FINAL_VERIFICATION_PLACEHOLDERS = new Set(["", "<command>", "<path>", "<paths>", "<output summary>"]);
-const NO_ARTIFACT_VALUES = new Set(["none", "n/a", "na", "not needed", "not applicable"]);
-
 const COMPLETION_GATE = `COMPLETION GATE
 
 Do not output ${COMPLETE_MARKER} based only on checked checklist items.
@@ -66,150 +65,6 @@ function readJson(filePath) {
 function writeJson(filePath, value) {
   ensureDir(filePath);
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-function sha256(content) {
-  return createHash("sha256").update(content).digest("hex");
-}
-
-function taskEvidence(content) {
-  return {
-    initialTaskFileHash: sha256(content),
-    initialTaskFileSize: Buffer.byteLength(content, "utf8"),
-    initialTaskFileRecordedAt: nowIso(),
-  };
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function finalVerificationValue(content, label) {
-  const pattern = new RegExp(`^\\s*-\\s*${escapeRegExp(label)}\\s*:\\s*(.*)\\s*$`, "im");
-  const match = content.match(pattern);
-  return match ? match[1].trim() : undefined;
-}
-
-function cleanFinalVerificationValue(value) {
-  return String(value || "").trim().replace(/^`|`$/g, "").replace(/^['"]|['"]$/g, "").trim();
-}
-
-function finalVerificationFields(content) {
-  const fields = {};
-  for (const label of FINAL_VERIFICATION_FIELDS) fields[label] = cleanFinalVerificationValue(finalVerificationValue(content, label));
-  return fields;
-}
-
-function parseArtifactPaths(value) {
-  const cleaned = cleanFinalVerificationValue(value);
-  if (NO_ARTIFACT_VALUES.has(cleaned.toLowerCase())) return [];
-  return cleaned
-    .split(",")
-    .map((item) => cleanFinalVerificationValue(item.trim()))
-    .filter((item) => item.length > 0 && !NO_ARTIFACT_VALUES.has(item.toLowerCase()));
-}
-
-function artifactStatuses(workingDirectory, artifactField) {
-  return parseArtifactPaths(artifactField).map((artifactPath) => {
-    const resolved = path.isAbsolute(artifactPath) ? artifactPath : path.resolve(workingDirectory, artifactPath);
-    return { path: artifactPath, exists: fs.existsSync(resolved) };
-  });
-}
-
-function validateFinalVerification(content) {
-  const reasons = [];
-  for (const label of FINAL_VERIFICATION_FIELDS) {
-    const value = finalVerificationValue(content, label);
-    const cleaned = cleanFinalVerificationValue(value);
-    if (value === undefined) {
-      reasons.push(`missing Final Verification field: ${label}`);
-    } else if (FINAL_VERIFICATION_PLACEHOLDERS.has(cleaned.toLowerCase())) {
-      reasons.push(`placeholder Final Verification field: ${label}`);
-    }
-  }
-  return reasons;
-}
-
-function validateAgentCompletion(cwd, agent) {
-  const taskFile = path.resolve(cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
-  if (!fs.existsSync(taskFile)) {
-    return { ok: false, reasons: [`task file not found: ${path.relative(cwd, taskFile)}`] };
-  }
-  const content = fs.readFileSync(taskFile, "utf8");
-  const hash = sha256(content);
-  const reasons = validateFinalVerification(content);
-  const fields = finalVerificationFields(content);
-  const workingDirectory = fields["Working directory"];
-  if (workingDirectory && !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory}`);
-  const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
-  for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
-  const monitor = agent.completionEvidence?.monitor;
-  if (!monitor) reasons.push("missing monitor verification: run verify-agent first");
-  else {
-    if (!monitor.ok || monitor.exitCode !== 0) reasons.push(`monitor verification failed: exit=${monitor.exitCode}`);
-    if (monitor.taskFileHash !== hash) reasons.push("monitor verification is stale for current task file");
-    if (monitor.command !== fields["Exact monitor-rerunnable command"]) reasons.push("monitor verification command differs from current Final Verification command");
-    if (monitor.workingDirectory !== workingDirectory) reasons.push("monitor verification working directory differs from current Final Verification working directory");
-    for (const artifact of monitor.artifacts || []) if (!artifact.exists) reasons.push(`monitor artifact missing: ${artifact.path}`);
-  }
-  const initialHash = agent.completionEvidence?.initialTaskFileHash;
-  if (initialHash && hash === initialHash) reasons.push("task file unchanged since agent creation");
-  return { ok: reasons.length === 0, reasons, hash, size: Buffer.byteLength(content, "utf8") };
-}
-
-function tailOutput(value) {
-  if (!value) return undefined;
-  return value.length > 4000 ? value.slice(value.length - 4000) : value;
-}
-
-function verifyAgent(cwd, agent, timeoutMs = 120000) {
-  const taskFile = path.resolve(cwd, agent.taskFile || path.join(RALPH_DIR, `${sanitize(agent.loopName)}.md`));
-  if (!fs.existsSync(taskFile)) return `Verification failed for ${agent.id}: task file not found: ${path.relative(cwd, taskFile)}`;
-  const content = fs.readFileSync(taskFile, "utf8");
-  const hash = sha256(content);
-  const reasons = validateFinalVerification(content);
-  const fields = finalVerificationFields(content);
-  const command = fields["Exact monitor-rerunnable command"];
-  const workingDirectory = fields["Working directory"];
-  if (!workingDirectory || !fs.existsSync(workingDirectory)) reasons.push(`Final Verification working directory not found: ${workingDirectory || "(missing)"}`);
-  const artifacts = workingDirectory ? artifactStatuses(workingDirectory, fields["Required preserved artifacts"]) : [];
-  for (const artifact of artifacts.filter((item) => !item.exists)) reasons.push(`required artifact not found: ${artifact.path}`);
-
-  let exitCode = null;
-  let stdoutTail;
-  let stderrTail;
-  let errorText;
-  if (reasons.length === 0) {
-    const result = spawnSync(command, { cwd: workingDirectory, shell: true, encoding: "utf8", timeout: timeoutMs });
-    exitCode = result.status;
-    stdoutTail = tailOutput(result.stdout);
-    stderrTail = tailOutput(result.stderr);
-    if (result.error) errorText = result.error.message;
-    if (result.error) reasons.push(`monitor command error: ${result.error.message}`);
-    if (result.status !== 0) reasons.push(`monitor command failed: exit=${result.status}`);
-  }
-  const ok = reasons.length === 0;
-  agent.completionEvidence = {
-    ...(agent.completionEvidence || {}),
-    monitor: { verifiedAt: nowIso(), taskFileHash: hash, command, workingDirectory, exitCode, ok, stdoutTail, stderrTail, error: errorText, artifacts },
-  };
-  writeJson(agentPath(cwd, agent.id), agent);
-  return ok ? `Verified ${agent.id}: ${command}` : `Verification failed for ${agent.id}: ${reasons.join("; ")}`;
-}
-
-function recordCompletionCheck(agent, validation) {
-  agent.completionEvidence = {
-    ...(agent.completionEvidence || {}),
-    completedTaskFileHash: validation.hash,
-    completedTaskFileSize: validation.size,
-    completionCheckedAt: nowIso(),
-    completionGateFailure: validation.ok ? undefined : validation.reasons.join("; "),
-  };
-  if (validation.ok) delete agent.completionEvidence.completionGateFailure;
-}
-
-function completionGateFailure(agent, validation) {
-  return `Completion gate failed for ${agent.id}: ${validation.reasons.join("; ")}`;
 }
 
 function runPath(cwd, runId) {
@@ -1040,7 +895,9 @@ function commandRecord(cwd, args, kind) {
 
 function commandVerifyAgent(cwd, args) {
   const agent = syncAgent(cwd, loadAgent(cwd, value(args, "--agent")));
-  return verifyAgent(cwd, agent, Number(value(args, "--timeout-ms", "120000")) || 120000);
+  const result = verifyAgent(cwd, agent, Number(value(args, "--timeout-ms", "120000")) || 120000);
+  writeJson(agentPath(cwd, agent.id), agent);
+  return result.text;
 }
 
 function commandAgentStatus(cwd, args, status) {
@@ -1144,19 +1001,10 @@ function commandEnqueue(cwd, args) {
   return `${agent.id}: queued for Pi/Ralph follow-up\nrecord: ${path.relative(cwd, recordPath)}\nprompt: ${path.relative(cwd, promptPath)}`;
 }
 
-function queuePromptHash(cwd, record) {
-  const promptPath = path.resolve(cwd, record.promptFile || "");
-  return fs.existsSync(promptPath) ? sha256(fs.readFileSync(promptPath, "utf8")) : undefined;
-}
-
 function appendQueueAttempt(cwd, record, status, reason) {
-  record.deliveryAttempts = [...(record.deliveryAttempts || []), {
-    at: nowIso(),
-    status,
-    reason,
-    queueGeneration: record.queueGeneration ?? 0,
-    promptHash: queuePromptHash(cwd, record),
-  }];
+  const promptPath = path.resolve(cwd, record.promptFile || "");
+  const prompt = fs.existsSync(promptPath) ? fs.readFileSync(promptPath, "utf8") : undefined;
+  record.deliveryAttempts = [...(record.deliveryAttempts || []), queueAttempt(record, status, reason, prompt, nowIso())];
 }
 
 function commandQueue(cwd, args) {

@@ -11,6 +11,8 @@ This one is cool because:
 
 **Note: Flat Ralph loops remain the default. Swarm mode adds a lightweight MCP-style control plane on top of Ralph state; the main assistant still acts as conductor/integrator.**
 
+See `ARCHITECTURE.md` for the agents/teams/workspace model and `STATE_SCHEMA.md` for durable swarm state fields.
+
 ## Installation
 
 ```bash

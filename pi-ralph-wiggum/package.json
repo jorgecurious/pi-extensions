@@ -11,7 +11,8 @@
     "pi-ralph-swarm": "swarm-cli.mjs"
   },
   "scripts": {
-    "check": "npx --yes -p typescript tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --noImplicitAny false index.ts typecheck-stubs.d.ts && node --check swarm-cli.mjs"
+    "check": "npx --yes -p typescript tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --noImplicitAny false index.ts typecheck-stubs.d.ts && node --check swarm-cli.mjs && node --check completion-gate.mjs && node --check scripts/completion-gate-smoke.mjs",
+    "smoke:completion-gate": "node scripts/completion-gate-smoke.mjs"
   },
   "repository": {
     "type": "git",
