@@ -186,6 +186,52 @@ function cognitiveLoad(cwd, run) {
   return { level, score, reasons, activeAgents, writerAgents, blockedAgents };
 }
 
+function ownedPathOverlaps(agents) {
+  const owners = new Map();
+  for (const agent of agents) {
+    for (const ownerPath of agent.ownedPaths || []) {
+      owners.set(ownerPath, [...(owners.get(ownerPath) || []), agent.id]);
+    }
+  }
+  return [...owners.entries()].filter(([, value]) => value.length > 1);
+}
+
+function advise(cwd, run) {
+  const load = cognitiveLoad(cwd, run);
+  const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
+  const activeAgents = agents.filter((agent) => agent.status === "active");
+  const activeWriters = activeAgents.filter((agent) => agent.mode === "writer");
+  const activeVerifiers = activeAgents.filter((agent) => agent.mode === "verifier");
+  const queued = listQueueRecords(cwd, { runId: run.id, status: "queued" });
+  const openEscalations = listEscalationRecords(cwd, { runId: run.id, status: "open" });
+  const highEscalations = openEscalations.filter((record) => record.severity === "high");
+  const unresolvedBlockers = (run.blockers || []).filter((blocker) => !blocker.resolvedAt);
+  const overlaps = ownedPathOverlaps(agents);
+  const recommendations = [];
+
+  if (load.level === "critical") recommendations.push("Pause risky spawning and reduce active work before assigning more tasks.");
+  if (highEscalations.length > 0) recommendations.push("Resolve high-severity escalations before any new edits.");
+  else if (openEscalations.length > 0) recommendations.push("Review open escalations before spawning new agents.");
+  if (unresolvedBlockers.length > 0) recommendations.push("Record an orchestrator decision or blocker resolution before continuing implementation.");
+  if (activeWriters.length > 1) recommendations.push("Reduce to one active writer or split owned paths before more edits.");
+  if (overlaps.length > 0) recommendations.push(`Resolve overlapping ownership: ${overlaps.map(([ownerPath, ids]) => `${ownerPath} (${ids.join(",")})`).join("; ")}.`);
+  if (activeWriters.length === 1 && activeVerifiers.length === 0) recommendations.push(`Add or resume a verifier for writer-owned paths: ${(activeWriters[0].ownedPaths || []).join(",") || "unspecified"}.`);
+  if (queued.length > 0 && activeAgents.length === 0) recommendations.push("Drain queued prompts or cancel stale queue records before spawning new agents.");
+  if (load.level === "low" && recommendations.length === 0) recommendations.push("Load is low; safe next step is a bounded scout/verifier/writer task chosen by the orchestrator.");
+  if (recommendations.length === 0) recommendations.push("Consolidate existing evidence before adding more concurrency.");
+
+  return {
+    urgency: load.level,
+    summary: `${load.level} load: ${recommendations[0]}`,
+    recommendations,
+    load,
+  };
+}
+
+function renderAdvice(advice) {
+  return [`Advice: ${advice.summary}`, ...advice.recommendations.map((item) => `- ${item}`)].join("\n");
+}
+
 function renderBoard(cwd, run) {
   const load = cognitiveLoad(cwd, run);
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
@@ -198,6 +244,7 @@ function renderBoard(cwd, run) {
   ];
   if (queued > 0) lines.push(`Queue: ${queued} queued prompt(s)`);
   if (openEscalations > 0) lines.push(`Escalations: ${openEscalations} open`);
+  lines.push(`Advice: ${advise(cwd, run).summary}`);
   if (run.constraints?.length) lines.push(`Constraints: ${run.constraints.join("; ")}`);
   lines.push("Agents:");
   if (agents.length === 0) lines.push("- none");
@@ -318,6 +365,10 @@ function commandSpawn(cwd, args) {
   const run = loadRun(cwd, value(args, "--run"));
   const role = value(args, "--role");
   if (!role) throw new Error("spawn requires --role <role>");
+  const normalizedRole = sanitize(role).toLowerCase();
+  if (normalizedRole === "advisor" || normalizedRole.endsWith("-advisor") || normalizedRole.endsWith("_advisor") || normalizedRole.includes("advisor_agent")) {
+    throw new Error("Advisor is manager-side behavior, not a swarm agent role. Use advise instead.");
+  }
   const agents = listAgents(cwd, run.id);
   const loopName = sanitize(value(args, "--loop", `swarm-${run.id}-${role}-${agents.length + 1}`));
   const taskFile = loopTaskPath(cwd, loopName);
@@ -468,6 +519,12 @@ function commandQueue(cwd, args) {
     .join("\n");
 }
 
+function commandAdvise(cwd, args) {
+  const runId = value(args, "--run") || listRuns(cwd).find((run) => run.status === "active")?.id;
+  if (!runId) return "No swarm runs found.";
+  return renderAdvice(advise(cwd, loadRun(cwd, runId)));
+}
+
 function commandEscalate(cwd, args) {
   const agentId = value(args, "--agent");
   const question = value(args, "--question") || value(args, "--text");
@@ -588,6 +645,7 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
         "swarm_drain_queue",
         "swarm_list_queue",
         "swarm_status",
+        "swarm_advise",
         "swarm_collect",
         "swarm_record_blocker",
         "swarm_escalate",
@@ -726,6 +784,7 @@ Commands:
   collect --agent ID
   enqueue --agent ID [--activate]
   queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
+  advise [--run ID]
   pi-queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed] [--model MODEL]
   delegate [--run ID] [--agent ID] [--limit N] [--model MODEL]
   escalate --agent ID --question TEXT [--severity low|medium|high] [--context TEXT] [--evidence PATH] [--option TEXT] [--pause]
@@ -757,6 +816,7 @@ function main() {
   }
   if (command === "enqueue") return commandEnqueue(cwd, args);
   if (command === "queue") return commandQueue(cwd, args);
+  if (command === "advise") return commandAdvise(cwd, args);
   if (command === "pi-queue") return commandPiQueue(cwd, args);
   if (command === "delegate") return commandDelegate(cwd, args);
   if (command === "escalate") return commandEscalate(cwd, args);

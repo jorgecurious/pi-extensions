@@ -11,6 +11,7 @@
 - Add `pi-ralph-swarm queue` for local inspection of queued, delivered, stale, or failed prompt records.
 - Add `pi-ralph-swarm pi-queue` and `pi-ralph-swarm delegate` to invoke the local extension through the installed Pi runtime with Kimi coding defaults from non-interactive environments.
 - Add durable swarm escalations via `swarm_escalate`, `swarm_list_escalations`, `swarm_resolve_escalation`, and matching `pi-ralph-swarm` CLI commands.
+- Add manager-side swarm advice via `swarm_advise`, `/swarm advise`, and `pi-ralph-swarm advise` without introducing advisor agents.
 
 ### Changed
 - Add a completion gate to Ralph prompts and skill guidance. Agents are now instructed to preserve required verification artifacts and record an exact monitor-rerunnable final command before emitting `<promise>COMPLETE</promise>`.

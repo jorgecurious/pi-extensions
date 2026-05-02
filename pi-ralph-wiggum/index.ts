@@ -186,6 +186,13 @@ interface CognitiveLoadReport {
 	blockedAgents: number;
 }
 
+interface SwarmAdvice {
+	urgency: CognitiveLoadLevel;
+	summary: string;
+	recommendations: string[];
+	load: CognitiveLoadReport;
+}
+
 const STATUS_ICONS: Record<LoopStatus, string> = { active: "▶", paused: "⏸", completed: "✓" };
 const SWARM_STATUS_ICONS: Record<SwarmRunStatus | SwarmAgentStatus, string> = {
 	active: "▶",
@@ -580,6 +587,54 @@ export default function (pi: ExtensionAPI) {
 		return { level, score, reasons, activeAgents, writerAgents, blockedAgents };
 	}
 
+	function ownedPathOverlaps(agents: SwarmAgent[]): Array<[string, string[]]> {
+		const pathOwners = new Map<string, string[]>();
+		for (const agent of agents) {
+			for (const ownerPath of agent.ownedPaths) {
+				const owners = pathOwners.get(ownerPath) || [];
+				owners.push(agent.id);
+				pathOwners.set(ownerPath, owners);
+			}
+		}
+		return [...pathOwners.entries()].filter(([, owners]) => owners.length > 1);
+	}
+
+	function adviseSwarm(ctx: ExtensionContext, run: SwarmRun): SwarmAdvice {
+		const load = cognitiveLoad(ctx, run);
+		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
+		const activeAgents = agents.filter((agent) => agent.status === "active");
+		const activeWriters = activeAgents.filter((agent) => agent.mode === "writer");
+		const activeVerifiers = activeAgents.filter((agent) => agent.mode === "verifier");
+		const queued = listSwarmQueueRecords(ctx, { runId: run.id, status: "queued" });
+		const openEscalations = listSwarmEscalationRecords(ctx, { runId: run.id, status: "open" });
+		const highEscalations = openEscalations.filter((record) => record.severity === "high");
+		const unresolvedBlockers = run.blockers.filter((blocker) => !blocker.resolvedAt);
+		const overlaps = ownedPathOverlaps(agents);
+		const recommendations: string[] = [];
+
+		if (load.level === "critical") recommendations.push("Pause risky spawning and reduce active work before assigning more tasks.");
+		if (highEscalations.length > 0) recommendations.push("Resolve high-severity escalations before any new edits.");
+		else if (openEscalations.length > 0) recommendations.push("Review open escalations before spawning new agents.");
+		if (unresolvedBlockers.length > 0) recommendations.push("Record an orchestrator decision or blocker resolution before continuing implementation.");
+		if (activeWriters.length > 1) recommendations.push("Reduce to one active writer or split owned paths before more edits.");
+		if (overlaps.length > 0) recommendations.push(`Resolve overlapping ownership: ${overlaps.map(([ownerPath, ids]) => `${ownerPath} (${ids.join(",")})`).join("; ")}.`);
+		if (activeWriters.length === 1 && activeVerifiers.length === 0) recommendations.push(`Add or resume a verifier for writer-owned paths: ${activeWriters[0].ownedPaths.join(",") || "unspecified"}.`);
+		if (queued.length > 0 && activeAgents.length === 0) recommendations.push("Drain queued prompts or cancel stale queue records before spawning new agents.");
+		if (load.level === "low" && recommendations.length === 0) recommendations.push("Load is low; safe next step is a bounded scout/verifier/writer task chosen by the orchestrator.");
+		if (recommendations.length === 0) recommendations.push("Consolidate existing evidence before adding more concurrency.");
+
+		return {
+			urgency: load.level,
+			summary: `${load.level} load: ${recommendations[0]}`,
+			recommendations,
+			load,
+		};
+	}
+
+	function renderSwarmAdvice(advice: SwarmAdvice): string {
+		return [`Advice: ${advice.summary}`, ...advice.recommendations.map((item) => `- ${item}`)].join("\n");
+	}
+
 	function renderSwarmBoard(ctx: ExtensionContext, run: SwarmRun): string {
 		const agents = listSwarmAgents(ctx, run.id).map((agent) => syncSwarmAgentFromLoop(ctx, agent));
 		const load = cognitiveLoad(ctx, run);
@@ -590,6 +645,7 @@ export default function (pi: ExtensionAPI) {
 			`Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
 		];
 		if (queuedCount > 0) lines.push(`Queue: ${queuedCount} queued prompt(s)`);
+		lines.push(`Advice: ${adviseSwarm(ctx, run).summary}`);
 		if (run.constraints.length > 0) lines.push(`Constraints: ${run.constraints.join("; ")}`);
 		if (agents.length === 0) {
 			lines.push("Agents: none");
@@ -1330,6 +1386,7 @@ Commands:
   /swarm stop [run]                Mark run completed
   /swarm queue [run]               List queued/delivered prompt records
   /swarm drain [run]               Deliver one queued prompt into Pi/Ralph
+  /swarm advise [run]              Show manager-side advisor recommendations
   /swarm escalations [run]         List open/resolved escalations
   /swarm summarize [run]           Show compact board
 
@@ -1381,6 +1438,11 @@ Agents should use the swarm_* tools for structured orchestration.`;
 					: `No agents for swarm ${run.id}.`,
 				"info",
 			);
+		},
+
+		advise(rest, ctx) {
+			const run = loadTargetSwarmRun(ctx, rest.trim() || undefined);
+			ctx.ui.notify(run ? renderSwarmAdvice(adviseSwarm(ctx, run)) : "No swarm run found.", run ? "info" : "warning");
 		},
 
 		pause(rest, ctx) {
@@ -1629,6 +1691,10 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			const run = loadSwarmRun(ctx, params.runId);
 			if (!run) return { content: [{ type: "text", text: `Swarm run not found: ${params.runId}` }], details: {} };
 			if (run.status !== "active") return { content: [{ type: "text", text: `Swarm run is ${run.status}: ${run.id}` }], details: {} };
+			const normalizedRole = sanitize(params.role).toLowerCase();
+			if (normalizedRole === "advisor" || normalizedRole.endsWith("-advisor") || normalizedRole.endsWith("_advisor") || normalizedRole.includes("advisor_agent")) {
+				return { content: [{ type: "text", text: "Advisor is manager-side behavior, not a swarm agent role. Use swarm_advise instead." }], details: {} };
+			}
 
 			const mode = (params.mode ?? "read-only") as SwarmAgentMode;
 			const allowedPaths = params.allowedPaths ?? [];
@@ -1733,6 +1799,19 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			const load = cognitiveLoad(ctx, run);
 			const text = `Load: ${load.level} (${load.score})\nActive agents: ${load.activeAgents}\nWriter agents: ${load.writerAgents}\nBlocked agents: ${load.blockedAgents}\nReasons: ${load.reasons.join(", ")}`;
 			return { content: [{ type: "text", text }], details: load };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_advise",
+		label: "Swarm Advisor",
+		description: "Return manager-side recommendations from swarm state without spawning an advisor agent.",
+		parameters: Type.Object({ runId: Type.Optional(Type.String()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const run = loadTargetSwarmRun(ctx, params.runId);
+			if (!run) return { content: [{ type: "text", text: "No swarm run found." }], details: {} };
+			const advice = adviseSwarm(ctx, run);
+			return { content: [{ type: "text", text: renderSwarmAdvice(advice) }], details: advice };
 		},
 	});
 
