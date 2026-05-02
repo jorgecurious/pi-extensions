@@ -70,6 +70,10 @@ function queueBase(cwd, agentId, queuedAt) {
   return path.join(cwd, SWARM_DIR, "queue", `${stamp}-${sanitize(agentId)}`);
 }
 
+function escalationPath(cwd, escalationId) {
+  return path.join(cwd, SWARM_DIR, "escalations", `${sanitize(escalationId)}.json`);
+}
+
 function listFiles(dir, suffix) {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((file) => file.endsWith(suffix)).sort();
@@ -113,6 +117,19 @@ function listQueueRecords(cwd, filters = {}) {
     .sort((a, b) => String(a.queuedAt || "").localeCompare(String(b.queuedAt || "")));
 }
 
+function listEscalationRecords(cwd, filters = {}) {
+  const dir = path.join(cwd, SWARM_DIR, "escalations");
+  return listFiles(dir, ".json")
+    .map((file) => readJson(path.join(dir, file)))
+    .filter((record) => {
+      if (filters.runId && record.runId !== sanitize(filters.runId)) return false;
+      if (filters.agentId && record.agentId !== sanitize(filters.agentId)) return false;
+      if (filters.status && record.status !== filters.status) return false;
+      return true;
+    })
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+}
+
 function listAgents(cwd, runId) {
   const byId = new Map();
   for (const { agent } of listAgentRecords(cwd)) {
@@ -141,6 +158,8 @@ function cognitiveLoad(cwd, run) {
   const writerAgents = agents.filter((agent) => agent.status === "active" && agent.mode === "writer").length;
   const blockedAgents = agents.filter((agent) => agent.status === "blocked").length;
   const unresolvedBlockers = (run.blockers || []).filter((blocker) => !blocker.resolvedAt).length;
+  const openEscalations = listEscalationRecords(cwd, { runId: run.id, status: "open" });
+  const highEscalations = openEscalations.filter((record) => record.severity === "high").length;
   const owners = new Map();
   for (const agent of agents) {
     for (const ownerPath of agent.ownedPaths || []) {
@@ -148,7 +167,7 @@ function cognitiveLoad(cwd, run) {
     }
   }
   const overlaps = [...owners.values()].filter((value) => value.length > 1).length;
-  let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + overlaps * 2;
+  let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + openEscalations.length * 2 + highEscalations * 2 + overlaps * 2;
   if (agents.length > (run.maxAgents || 4)) score += agents.length - run.maxAgents;
   let level = "low";
   if (score >= 10) level = "critical";
@@ -159,6 +178,8 @@ function cognitiveLoad(cwd, run) {
   if (writerAgents > 1) reasons.push(`${writerAgents} active writer agent(s)`);
   if (blockedAgents > 0) reasons.push(`${blockedAgents} blocked agent(s)`);
   if (unresolvedBlockers > 0) reasons.push(`${unresolvedBlockers} unresolved blocker(s)`);
+  if (openEscalations.length > 0) reasons.push(`${openEscalations.length} open escalation(s)`);
+  if (highEscalations > 0) reasons.push(`${highEscalations} high escalation(s)`);
   if (overlaps > 0) reasons.push(`${overlaps} overlapping owned path(s)`);
   if (agents.length > (run.maxAgents || 4)) reasons.push(`${agents.length}/${run.maxAgents || 4} agent budget exceeded`);
   if (reasons.length === 0) reasons.push("within budget");
@@ -169,12 +190,14 @@ function renderBoard(cwd, run) {
   const load = cognitiveLoad(cwd, run);
   const agents = listAgents(cwd, run.id).map((agent) => syncAgent(cwd, agent));
   const queued = listQueueRecords(cwd, { runId: run.id, status: "queued" }).length;
+  const openEscalations = listEscalationRecords(cwd, { runId: run.id, status: "open" }).length;
   const lines = [
     `Swarm: ${run.id} (${run.status})`,
     `Goal: ${run.goal || "(none recorded)"}`,
     `Load: ${load.level} (${load.score}) - ${load.reasons.join(", ")}`,
   ];
   if (queued > 0) lines.push(`Queue: ${queued} queued prompt(s)`);
+  if (openEscalations > 0) lines.push(`Escalations: ${openEscalations} open`);
   if (run.constraints?.length) lines.push(`Constraints: ${run.constraints.join("; ")}`);
   lines.push("Agents:");
   if (agents.length === 0) lines.push("- none");
@@ -185,6 +208,16 @@ function renderBoard(cwd, run) {
   const unresolved = (run.blockers || []).filter((blocker) => !blocker.resolvedAt);
   if (unresolved.length) lines.push(`Blockers: ${unresolved.map((blocker) => blocker.text).join("; ")}`);
   return lines.join("\n");
+}
+
+function renderEscalations(records) {
+  if (records.length === 0) return "No swarm escalations.";
+  return records
+    .map((record) => {
+      const resolved = record.resolvedAt ? ` resolved=${record.resolvedAt}` : "";
+      return `${record.id}: ${record.status}, ${record.severity}, agent=${record.agentId}, decision=${record.needsOrchestratorDecision}, created=${record.createdAt}${resolved}\n  Q: ${record.question}`;
+    })
+    .join("\n");
 }
 
 function values(args, flag) {
@@ -435,6 +468,99 @@ function commandQueue(cwd, args) {
     .join("\n");
 }
 
+function commandEscalate(cwd, args) {
+  const agentId = value(args, "--agent");
+  const question = value(args, "--question") || value(args, "--text");
+  if (!agentId) throw new Error("escalate requires --agent <id>");
+  if (!question) throw new Error("escalate requires --question <text>");
+  const agent = syncAgent(cwd, loadAgent(cwd, agentId));
+  const run = loadRun(cwd, agent.runId);
+  const severity = value(args, "--severity", "medium");
+  if (!["low", "medium", "high"].includes(severity)) throw new Error("--severity must be low, medium, or high");
+  const createdAt = nowIso();
+  const id = `${createdAt.replace(/[:.]/g, "-")}-${agent.id}`;
+  const record = {
+    schemaVersion: 1,
+    id,
+    runId: run.id,
+    agentId: agent.id,
+    loopName: agent.loopName,
+    status: "open",
+    severity,
+    question,
+    context: value(args, "--context"),
+    evidenceFiles: values(args, "--evidence"),
+    recommendedOptions: values(args, "--option"),
+    needsOrchestratorDecision: !has(args, "--no-decision"),
+    createdAt,
+  };
+  writeJson(escalationPath(cwd, id), record);
+
+  const shouldPause = has(args, "--pause") || (!has(args, "--no-pause") && severity === "high");
+  if (shouldPause) {
+    const stateFile = loopStatePath(cwd, agent.loopName);
+    if (fs.existsSync(stateFile)) {
+      const state = readJson(stateFile);
+      state.status = "paused";
+      state.active = false;
+      writeJson(stateFile, state);
+    }
+    agent.status = severity === "high" ? "blocked" : "paused";
+    agent.updatedAt = createdAt;
+    writeJson(agentPath(cwd, agent.id), agent);
+  }
+
+  if (severity === "high") {
+    run.blockers = run.blockers || [];
+    run.blockers.push({ text: `Escalation ${id}: ${question}`, neededDecision: record.needsOrchestratorDecision ? "orchestrator decision" : undefined, createdAt });
+  }
+  run.updatedAt = createdAt;
+  writeJson(runPath(cwd, run.id), run);
+  return `Escalated ${id}: ${severity}\n${question}`;
+}
+
+function commandEscalations(cwd, args) {
+  const records = listEscalationRecords(cwd, {
+    runId: value(args, "--run"),
+    agentId: value(args, "--agent"),
+    status: value(args, "--status"),
+  });
+  return renderEscalations(records);
+}
+
+function commandResolveEscalation(cwd, args) {
+  const id = value(args, "--id");
+  const decision = value(args, "--decision");
+  if (!id) throw new Error("resolve-escalation requires --id <id>");
+  if (!decision) throw new Error("resolve-escalation requires --decision <text>");
+  const filePath = escalationPath(cwd, id);
+  if (!fs.existsSync(filePath)) throw new Error(`Escalation not found: ${id}`);
+  const record = readJson(filePath);
+  record.status = "resolved";
+  record.resolvedAt = record.resolvedAt || nowIso();
+  record.resolvedBy = "orchestrator";
+  record.decision = decision || record.decision;
+  record.resolutionNote = value(args, "--note") || record.resolutionNote;
+  writeJson(filePath, record);
+
+  const agent = loadAgent(cwd, record.agentId);
+  if (agent.status === "blocked") {
+    agent.status = "paused";
+    agent.updatedAt = record.resolvedAt;
+    writeJson(agentPath(cwd, agent.id), agent);
+  }
+
+  const run = loadRun(cwd, record.runId);
+  for (const blocker of run.blockers || []) {
+    if (!blocker.resolvedAt && String(blocker.text || "").startsWith(`Escalation ${record.id}:`)) blocker.resolvedAt = record.resolvedAt;
+  }
+  run.decisions = run.decisions || [];
+  if (decision) run.decisions.push({ text: `Resolved escalation ${record.id}: ${decision}`, rationale: record.resolutionNote, createdAt: record.resolvedAt });
+  run.updatedAt = record.resolvedAt;
+  writeJson(runPath(cwd, run.id), run);
+  return `Resolved escalation ${record.id}: ${decision}`;
+}
+
 function piRuntimeOptions(cwd, args, toolName, params, prompt) {
   const piBin = value(args, "--pi", process.env.PI_RALPH_SWARM_PI || "pi");
   const model = value(args, "--model", process.env.PI_RALPH_SWARM_MODEL || DEFAULT_PI_MODEL);
@@ -464,6 +590,9 @@ function piRuntimeOptions(cwd, args, toolName, params, prompt) {
         "swarm_status",
         "swarm_collect",
         "swarm_record_blocker",
+        "swarm_escalate",
+        "swarm_list_escalations",
+        "swarm_resolve_escalation",
       ].join(","),
     );
   }
@@ -599,6 +728,9 @@ Commands:
   queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed]
   pi-queue [--run ID] [--agent ID] [--status queued|delivered|stale|failed] [--model MODEL]
   delegate [--run ID] [--agent ID] [--limit N] [--model MODEL]
+  escalate --agent ID --question TEXT [--severity low|medium|high] [--context TEXT] [--evidence PATH] [--option TEXT] [--pause]
+  escalations [--run ID] [--agent ID] [--status open|resolved]
+  resolve-escalation --id ID --decision TEXT [--note TEXT]
   decision --run ID --text TEXT [--rationale TEXT]
   blocker --run ID --text TEXT [--needed-decision TEXT]
   pause-agent --agent ID
@@ -627,6 +759,9 @@ function main() {
   if (command === "queue") return commandQueue(cwd, args);
   if (command === "pi-queue") return commandPiQueue(cwd, args);
   if (command === "delegate") return commandDelegate(cwd, args);
+  if (command === "escalate") return commandEscalate(cwd, args);
+  if (command === "escalations") return commandEscalations(cwd, args);
+  if (command === "resolve-escalation") return commandResolveEscalation(cwd, args);
   if (command === "decision") return commandRecord(cwd, args, "decision");
   if (command === "blocker") return commandRecord(cwd, args, "blocker");
   if (command === "pause-agent") return commandAgentStatus(cwd, args, "paused");

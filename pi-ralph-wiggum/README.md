@@ -96,6 +96,7 @@ Swarm mode stores top-level run and subagent metadata under `.ralph/swarm/` whil
 | `/swarm stop [run]` | Mark the run completed |
 | `/swarm queue [run]` | List queued/delivered prompt records |
 | `/swarm drain [run]` | Deliver one queued prompt into Pi/Ralph follow-up |
+| `/swarm escalations [run]` | List open/resolved escalation records |
 | `/swarm summarize [run]` | Show a compact board |
 
 ### Swarm agent tools
@@ -135,10 +136,13 @@ Additional tools:
 - `swarm_cancel_agent`: cancel an agent while preserving its task file.
 - `swarm_record_decision`: persist an integration decision.
 - `swarm_record_blocker`: persist a blocker and raise load.
+- `swarm_escalate`: persist a question or risk for orchestrator review.
+- `swarm_list_escalations`: list open or resolved escalation records.
+- `swarm_resolve_escalation`: record the orchestrator decision for an escalation.
 
 ### Cognitive load policy
 
-The swarm board scores load from active agents, active writer agents, blocked agents, unresolved blockers, and overlapping owned paths.
+The swarm board scores load from active agents, active writer agents, blocked agents, unresolved blockers, open escalations, high-severity escalations, and overlapping owned paths.
 
 - Low: continue normally.
 - Medium: prefer one writer plus read-only verifier/scout agents.
@@ -163,6 +167,9 @@ pi-ralph-swarm enqueue --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm queue --run metal-pr-review
 pi-ralph-swarm pi-queue --run metal-pr-review
 pi-ralph-swarm delegate --run metal-pr-review --limit 1
+pi-ralph-swarm escalate --agent swarm-metal-pr-review-verifier-1 --severity high --question "Tests fail after review patch; should I pause or narrow scope?" --evidence .ralph/swarm-metal-pr-review-verifier-1.md
+pi-ralph-swarm escalations --run metal-pr-review --status open
+pi-ralph-swarm resolve-escalation --id ESCALATION_ID --decision "Pause writer and collect failing command first"
 pi-ralph-swarm status --run metal-pr-review
 pi-ralph-swarm collect --agent swarm-metal-pr-review-verifier-1
 pi-ralph-swarm doctor --run metal-pr-review --fix
@@ -179,6 +186,8 @@ Inside Pi, use `/swarm queue` or `swarm_list_queue` to inspect those records, th
 Outside an interactive Pi session, use `pi-ralph-swarm pi-queue` to verify the local extension can be loaded by the installed `pi` runtime, or `pi-ralph-swarm delegate` to launch a non-interactive Pi/Kimi session that calls `swarm_drain_queue` and continues with the delivered Ralph prompt. The default model is `kimi-coding/kimi-for-coding`; override it with `--model` or `PI_RALPH_SWARM_MODEL`. Use `--dry-run` to print the generated `pi` invocation without executing it. Use `--timeout-ms` or `PI_RALPH_SWARM_TIMEOUT_MS` to bound non-interactive delegate runs.
 
 Use `pi-ralph-swarm doctor` to detect duplicate or non-canonical local agent state files after manual edits or older CLI runs. Add `--fix` to rewrite canonical records and remove stale duplicates.
+
+Use `swarm_escalate` or `pi-ralph-swarm escalate` when a subagent needs orchestrator guidance before continuing. Escalations are stored under `.ralph/swarm/escalations/*.json` with severity, question, context, evidence files, recommended options, and whether an orchestrator decision is required. High-severity escalations block the agent by default and raise swarm load until `swarm_resolve_escalation` or `pi-ralph-swarm resolve-escalation` records the decision.
 
 ### Options for start
 

@@ -68,6 +68,8 @@ type SwarmRunStatus = "active" | "paused" | "completed";
 type SwarmAgentStatus = "queued" | "active" | "paused" | "blocked" | "completed" | "cancelled";
 type SwarmAgentMode = "read-only" | "writer" | "verifier" | "integrator";
 type SwarmQueueStatus = "queued" | "delivered" | "stale" | "failed";
+type SwarmEscalationSeverity = "low" | "medium" | "high";
+type SwarmEscalationStatus = "open" | "resolved";
 type CognitiveLoadLevel = "low" | "medium" | "high" | "critical";
 
 interface LoopState {
@@ -153,6 +155,26 @@ interface SwarmQueueRecord {
 	stateFile: string;
 	taskFile: string;
 	note?: string;
+}
+
+interface SwarmEscalationRecord {
+	schemaVersion: number;
+	id: string;
+	runId: string;
+	agentId: string;
+	loopName: string;
+	status: SwarmEscalationStatus;
+	severity: SwarmEscalationSeverity;
+	question: string;
+	context?: string;
+	evidenceFiles: string[];
+	recommendedOptions: string[];
+	needsOrchestratorDecision: boolean;
+	createdAt: string;
+	resolvedAt?: string;
+	resolvedBy?: string;
+	decision?: string;
+	resolutionNote?: string;
 }
 
 interface CognitiveLoadReport {
@@ -273,9 +295,11 @@ export default function (pi: ExtensionAPI) {
 
 	const swarmDir = (ctx: ExtensionContext) => path.resolve(ctx.cwd, SWARM_DIR);
 	const swarmQueueDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "queue");
+	const swarmEscalationDir = (ctx: ExtensionContext) => path.join(swarmDir(ctx), "escalations");
 	const swarmRunPath = (ctx: ExtensionContext, runId: string) => path.join(swarmDir(ctx), `${sanitize(runId)}.run.json`);
 	const swarmAgentPath = (ctx: ExtensionContext, agentId: string) => path.join(swarmDir(ctx), `${sanitize(agentId)}.agent.json`);
 	const swarmQueuePath = (ctx: ExtensionContext, queueId: string) => path.join(swarmQueueDir(ctx), `${sanitize(queueId)}.json`);
+	const swarmEscalationPath = (ctx: ExtensionContext, escalationId: string) => path.join(swarmEscalationDir(ctx), `${sanitize(escalationId)}.json`);
 
 	function nowIso(): string {
 		return new Date().toISOString();
@@ -344,6 +368,28 @@ export default function (pi: ExtensionAPI) {
 			stateFile: raw.stateFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.state.json`),
 			taskFile: raw.taskFile || path.join(RALPH_DIR, `${sanitize(raw.loopName)}.md`),
 			note: raw.note,
+		};
+	}
+
+	function migrateSwarmEscalationRecord(raw: Partial<SwarmEscalationRecord> & { id: string; runId: string; agentId: string; loopName: string; question: string }): SwarmEscalationRecord {
+		return {
+			schemaVersion: raw.schemaVersion ?? 1,
+			id: sanitize(raw.id),
+			runId: sanitize(raw.runId),
+			agentId: sanitize(raw.agentId),
+			loopName: sanitize(raw.loopName),
+			status: raw.status || "open",
+			severity: raw.severity || "medium",
+			question: raw.question || "",
+			context: raw.context,
+			evidenceFiles: normalizeStringList(raw.evidenceFiles),
+			recommendedOptions: normalizeStringList(raw.recommendedOptions),
+			needsOrchestratorDecision: raw.needsOrchestratorDecision ?? true,
+			createdAt: raw.createdAt || nowIso(),
+			resolvedAt: raw.resolvedAt,
+			resolvedBy: raw.resolvedBy,
+			decision: raw.decision,
+			resolutionNote: raw.resolutionNote,
 		};
 	}
 
@@ -428,6 +474,37 @@ export default function (pi: ExtensionAPI) {
 			.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
 	}
 
+	function loadSwarmEscalationRecord(ctx: ExtensionContext, escalationId: string): SwarmEscalationRecord | null {
+		const content = tryRead(swarmEscalationPath(ctx, escalationId));
+		return content ? migrateSwarmEscalationRecord(JSON.parse(content)) : null;
+	}
+
+	function saveSwarmEscalationRecord(ctx: ExtensionContext, record: SwarmEscalationRecord): void {
+		const filePath = swarmEscalationPath(ctx, record.id);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(record, null, 2), "utf-8");
+	}
+
+	function listSwarmEscalationRecords(ctx: ExtensionContext, filters: { runId?: string; agentId?: string; status?: SwarmEscalationStatus } = {}): SwarmEscalationRecord[] {
+		const dir = swarmEscalationDir(ctx);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				const content = tryRead(path.join(dir, f));
+				return content ? migrateSwarmEscalationRecord(JSON.parse(content)) : null;
+			})
+			.filter((record): record is SwarmEscalationRecord => {
+				if (!record) return false;
+				if (filters.runId && record.runId !== sanitize(filters.runId)) return false;
+				if (filters.agentId && record.agentId !== sanitize(filters.agentId)) return false;
+				if (filters.status && record.status !== filters.status) return false;
+				return true;
+			})
+			.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	}
+
 	function latestActiveSwarmRun(ctx: ExtensionContext): SwarmRun | null {
 		const runs = listSwarmRuns(ctx).filter((run) => run.status === "active");
 		if (runs.length === 0) return null;
@@ -469,6 +546,8 @@ export default function (pi: ExtensionAPI) {
 		const writerAgents = agents.filter((agent) => agent.status === "active" && agent.mode === "writer").length;
 		const blockedAgents = agents.filter((agent) => agent.status === "blocked").length;
 		const unresolvedBlockers = run.blockers.filter((blocker) => !blocker.resolvedAt).length;
+		const openEscalations = listSwarmEscalationRecords(ctx, { runId: run.id, status: "open" });
+		const highEscalations = openEscalations.filter((record) => record.severity === "high").length;
 		const pathOwners = new Map<string, string[]>();
 		for (const agent of agents) {
 			for (const ownerPath of agent.ownedPaths) {
@@ -479,7 +558,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const overlaps = [...pathOwners.values()].filter((owners) => owners.length > 1).length;
 
-		let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + overlaps * 2;
+		let score = activeAgents + writerAgents * 2 + blockedAgents * 2 + unresolvedBlockers * 2 + openEscalations.length * 2 + highEscalations * 2 + overlaps * 2;
 		if (agents.length > run.maxAgents) score += agents.length - run.maxAgents;
 
 		const reasons: string[] = [];
@@ -487,6 +566,8 @@ export default function (pi: ExtensionAPI) {
 		if (writerAgents > 1) reasons.push(`${writerAgents} active writer agent(s)`);
 		if (blockedAgents > 0) reasons.push(`${blockedAgents} blocked agent(s)`);
 		if (unresolvedBlockers > 0) reasons.push(`${unresolvedBlockers} unresolved blocker(s)`);
+		if (openEscalations.length > 0) reasons.push(`${openEscalations.length} open escalation(s)`);
+		if (highEscalations > 0) reasons.push(`${highEscalations} high escalation(s)`);
 		if (overlaps > 0) reasons.push(`${overlaps} overlapping owned path(s)`);
 		if (agents.length > run.maxAgents) reasons.push(`${agents.length}/${run.maxAgents} agent budget exceeded`);
 		if (reasons.length === 0) reasons.push("within budget");
@@ -534,6 +615,95 @@ export default function (pi: ExtensionAPI) {
 				return `${record.id}: ${record.status}, agent=${record.agentId}, gen=${record.queueGeneration}, queued=${record.queuedAt}${delivered}${failure}`;
 			})
 			.join("\n");
+	}
+
+	function renderSwarmEscalations(records: SwarmEscalationRecord[]): string {
+		if (records.length === 0) return "No swarm escalations.";
+		return records
+			.map((record) => {
+				const resolved = record.resolvedAt ? ` resolved=${record.resolvedAt}` : "";
+				return `${record.id}: ${record.status}, ${record.severity}, agent=${record.agentId}, decision=${record.needsOrchestratorDecision}, created=${record.createdAt}${resolved}\n  Q: ${record.question}`;
+			})
+			.join("\n");
+	}
+
+	function createSwarmEscalation(
+		ctx: ExtensionContext,
+		agent: SwarmAgent,
+		params: {
+			severity?: SwarmEscalationSeverity;
+			question: string;
+			context?: string;
+			evidenceFiles?: string[];
+			recommendedOptions?: string[];
+			needsOrchestratorDecision?: boolean;
+			pauseAgent?: boolean;
+		},
+	): SwarmEscalationRecord {
+		const createdAt = nowIso();
+		const severity = params.severity || "medium";
+		const id = `${createdAt.replace(/[:.]/g, "-")}-${agent.id}`;
+		const record: SwarmEscalationRecord = {
+			schemaVersion: 1,
+			id,
+			runId: agent.runId,
+			agentId: agent.id,
+			loopName: agent.loopName,
+			status: "open",
+			severity,
+			question: params.question,
+			context: params.context,
+			evidenceFiles: params.evidenceFiles || [],
+			recommendedOptions: params.recommendedOptions || [],
+			needsOrchestratorDecision: params.needsOrchestratorDecision ?? true,
+			createdAt,
+		};
+		saveSwarmEscalationRecord(ctx, record);
+
+		const shouldPause = params.pauseAgent ?? severity === "high";
+		if (shouldPause) {
+			const loop = loadState(ctx, agent.loopName);
+			if (loop) {
+				loop.status = "paused";
+				loop.active = false;
+				saveState(ctx, loop);
+			}
+			agent.status = severity === "high" ? "blocked" : "paused";
+			saveSwarmAgent(ctx, agent);
+		}
+		const run = loadSwarmRun(ctx, agent.runId);
+		if (run) {
+			if (severity === "high") {
+				run.blockers.push({ text: `Escalation ${record.id}: ${record.question}`, neededDecision: params.needsOrchestratorDecision ? "orchestrator decision" : undefined, createdAt });
+			}
+			saveSwarmRun(ctx, run);
+		}
+		updateUI(ctx);
+		return record;
+	}
+
+	function resolveSwarmEscalation(ctx: ExtensionContext, record: SwarmEscalationRecord, decision: string, resolutionNote?: string): SwarmEscalationRecord {
+		record.status = "resolved";
+		record.resolvedAt = record.resolvedAt || nowIso();
+		record.resolvedBy = "orchestrator";
+		record.decision = decision || record.decision;
+		record.resolutionNote = resolutionNote || record.resolutionNote;
+		saveSwarmEscalationRecord(ctx, record);
+		const agent = loadSwarmAgent(ctx, record.agentId);
+		if (agent?.status === "blocked") {
+			agent.status = "paused";
+			saveSwarmAgent(ctx, agent);
+		}
+		const run = loadSwarmRun(ctx, record.runId);
+		if (run) {
+			for (const blocker of run.blockers) {
+				if (!blocker.resolvedAt && blocker.text.startsWith(`Escalation ${record.id}:`)) blocker.resolvedAt = record.resolvedAt;
+			}
+			if (decision) run.decisions.push({ text: `Resolved escalation ${record.id}: ${decision}`, rationale: resolutionNote, createdAt: record.resolvedAt });
+			saveSwarmRun(ctx, run);
+		}
+		updateUI(ctx);
+		return record;
 	}
 
 	function markQueueRecord(ctx: ExtensionContext, record: SwarmQueueRecord, status: SwarmQueueStatus, failureReason?: string): SwarmQueueRecord {
@@ -1160,6 +1330,7 @@ Commands:
   /swarm stop [run]                Mark run completed
   /swarm queue [run]               List queued/delivered prompt records
   /swarm drain [run]               Deliver one queued prompt into Pi/Ralph
+  /swarm escalations [run]         List open/resolved escalations
   /swarm summarize [run]           Show compact board
 
 Agents should use the swarm_* tools for structured orchestration.`;
@@ -1259,6 +1430,14 @@ Agents should use the swarm_* tools for structured orchestration.`;
 				return;
 			}
 			ctx.ui.notify(deliverQueuedSwarmPrompt(ctx, records[0]), "info");
+		},
+
+		escalations(rest, ctx) {
+			const runId = rest.trim() || undefined;
+			const run = loadTargetSwarmRun(ctx, runId);
+			if (runId && !run) return ctx.ui.notify("No swarm run found.", "warning");
+			const records = listSwarmEscalationRecords(ctx, run ? { runId: run.id } : {});
+			ctx.ui.notify(renderSwarmEscalations(records), records.length > 0 ? "info" : "warning");
 		},
 
 		summarize(rest, ctx) {
@@ -1701,6 +1880,72 @@ Agents should use the swarm_* tools for structured orchestration.`;
 			saveSwarmRun(ctx, run);
 			updateUI(ctx);
 			return { content: [{ type: "text", text: `Recorded blocker for ${run.id}: ${params.blocker}` }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_escalate",
+		label: "Escalate Swarm Issue",
+		description: "Create a durable escalation record for orchestrator review. High severity blocks the agent by default.",
+		parameters: Type.Object({
+			agentId: Type.String(),
+			question: Type.String(),
+			severity: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])),
+			context: Type.Optional(Type.String()),
+			evidenceFiles: Type.Optional(Type.Array(Type.String())),
+			recommendedOptions: Type.Optional(Type.Array(Type.String())),
+			needsOrchestratorDecision: Type.Optional(Type.Boolean({ default: true })),
+			pauseAgent: Type.Optional(Type.Boolean({ description: "Pause/block the agent after escalation. Defaults to true for high severity.", default: false })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const agent = loadSwarmAgent(ctx, params.agentId);
+			if (!agent) return { content: [{ type: "text", text: `Agent not found: ${params.agentId}` }], details: {} };
+			const record = createSwarmEscalation(ctx, agent, {
+				severity: params.severity as SwarmEscalationSeverity | undefined,
+				question: params.question,
+				context: params.context,
+				evidenceFiles: params.evidenceFiles,
+				recommendedOptions: params.recommendedOptions,
+				needsOrchestratorDecision: params.needsOrchestratorDecision,
+				pauseAgent: params.pauseAgent,
+			});
+			return { content: [{ type: "text", text: `Escalated ${record.id}: ${record.severity}\n${record.question}` }], details: { escalationId: record.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_list_escalations",
+		label: "List Swarm Escalations",
+		description: "List durable escalation records for orchestrator review.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String()),
+			agentId: Type.Optional(Type.String()),
+			status: Type.Optional(Type.Union([Type.Literal("open"), Type.Literal("resolved")])),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const records = listSwarmEscalationRecords(ctx, {
+				runId: params.runId,
+				agentId: params.agentId,
+				status: params.status as SwarmEscalationStatus | undefined,
+			});
+			return { content: [{ type: "text", text: renderSwarmEscalations(records) }], details: { count: records.length } };
+		},
+	});
+
+	pi.registerTool({
+		name: "swarm_resolve_escalation",
+		label: "Resolve Swarm Escalation",
+		description: "Resolve an open swarm escalation and record the orchestrator decision.",
+		parameters: Type.Object({
+			escalationId: Type.String(),
+			decision: Type.String(),
+			resolutionNote: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const record = loadSwarmEscalationRecord(ctx, params.escalationId);
+			if (!record) return { content: [{ type: "text", text: `Escalation not found: ${params.escalationId}` }], details: {} };
+			const resolved = resolveSwarmEscalation(ctx, record, params.decision, params.resolutionNote);
+			return { content: [{ type: "text", text: `Resolved escalation ${resolved.id}: ${params.decision}` }], details: { escalationId: resolved.id } };
 		},
 	});
 
